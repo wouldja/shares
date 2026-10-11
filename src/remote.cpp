@@ -6,6 +6,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMutexLocker>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -54,22 +55,17 @@ bool toolExists(RemoteLink *link, const QStringList &paths) {
     return false;
 }
 
-bool pullOne(RemoteLink *link, const QString &remotePath, const QString &localPath, QString *error) {
-    auto result = link->exec({"sudo", "-n", "cat", remotePath}, {}, 20000);
-    if (result.code != 0) {
-        const auto message = result.err + result.out;
-        if (message.contains("No such file") || message.contains("Not a directory"))
-            result.out.clear();
-        else if (message.contains("a password is required") || message.contains("sudo")) {
-            if (error && error->isEmpty())
-                *error = "The SSH user needs passwordless sudo to read the share files.";
-            return false;
-        } else if (!message.trimmed().isEmpty()) {
-            if (error && error->isEmpty())
-                *error = message.trimmed();
-            return false;
-        }
-    }
+bool bundlePathOk(const QString &path) {
+    static const QStringList fixed{"/etc/samba/shares.conf", "/etc/samba/smb.conf", "/etc/exports", "/etc/shares/iscsi.json",
+                                   "/etc/shares/s3.json"};
+    if (fixed.contains(path))
+        return true;
+    static const QRegularExpression exportPath("^/etc/exports\\.d/[A-Za-z0-9._-]+\\.exports$");
+    return exportPath.match(path).hasMatch();
+}
+
+bool writeBundleFile(const QString &root, const QString &remotePath, const QByteArray &body, QString *error) {
+    const auto localPath = root + remotePath;
     QDir().mkpath(QFileInfo(localPath).absolutePath());
     QSaveFile out(localPath);
     if (!out.open(QIODevice::WriteOnly)) {
@@ -77,8 +73,42 @@ bool pullOne(RemoteLink *link, const QString &remotePath, const QString &localPa
             *error = "Could not store a copy of " + remotePath;
         return false;
     }
-    out.write(result.out.toUtf8());
-    return out.commit();
+    out.write(body);
+    if (!out.commit()) {
+        if (error)
+            *error = "Could not store a copy of " + remotePath;
+        return false;
+    }
+    return true;
+}
+
+// Fixed script. No single quotes, so it can sit inside one remote shell argument.
+// Each file is capped at 1 MiB. Missing files are skipped. A weird name is ignored
+// on this side, so the remote glob cannot choose where bytes are written.
+QString remoteBundleScript() {
+    return QStringLiteral(
+        "emit() {"
+        " f=$1;"
+        " if [ -f \"$f\" ]; then"
+        " n=$(wc -c < \"$f\" | tr -d \" \");"
+        " case \"$n\" in \"\"|*[!0-9]*) printf \"ERR %s\\n\" \"$f\"; return ;; esac;"
+        " if [ \"$n\" -gt 1048576 ]; then printf \"SKIP %s\\n\" \"$f\"; return; fi;"
+        " printf \"FILE %s %s\\n\" \"$f\" \"$n\";"
+        " head -c \"$n\" \"$f\";"
+        " printf \"\\n\";"
+        " else printf \"MISS %s\\n\" \"$f\";"
+        " fi;"
+        "};"
+        " emit /etc/samba/shares.conf;"
+        " emit /etc/samba/smb.conf;"
+        " emit /etc/exports;"
+        " emit /etc/shares/iscsi.json;"
+        " emit /etc/shares/s3.json;"
+        " if [ -d /etc/exports.d ]; then"
+        " for f in /etc/exports.d/*.exports; do"
+        " if [ -f \"$f\" ]; then emit \"$f\"; fi;"
+        " done;"
+        " fi");
 }
 
 } // namespace
@@ -89,6 +119,7 @@ SshLink::SshLink(QString user, QString host, int port, bool tailscaleSsh)
 void SshLink::trustNextKey() { m_trustNext = true; }
 
 CommandResult SshLink::exec(const QStringList &argv, const QString &input, int timeoutMs) {
+    QMutexLocker lock(&m_execLock);
     QStringList args;
     if (m_tailscaleSsh) {
         // tailscale ssh reaches a peer that has Tailscale SSH on, without a
@@ -104,8 +135,8 @@ CommandResult SshLink::exec(const QStringList &argv, const QString &input, int t
     return runProcess(args.first(), args.mid(1), input, timeoutMs);
 }
 
-CommandResult RemoteCommands::run(const QString &program, const QStringList &args, const QString &input) {
-    auto result = m_link->exec(QStringList{program} + args, input, 20000);
+CommandResult RemoteCommands::run(const QString &program, const QStringList &args, const QString &input, int timeoutMs) {
+    auto result = m_link->exec(QStringList{program} + args, input, timeoutMs);
     const auto message = result.err + result.out;
     if (result.code == 127 || message.contains("command not found") || message.contains("not found"))
         result.missing = true;
@@ -244,27 +275,86 @@ RemoteNeed probeRemote(RemoteLink *link) {
     return need;
 }
 
-bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error) {
-    const QStringList files{"/etc/samba/shares.conf", "/etc/samba/smb.conf", "/etc/exports", "/etc/shares/iscsi.json",
-                            "/etc/shares/s3.json"};
-    for (const auto &remotePath : files) {
-        if (!pullOne(link, remotePath, root + remotePath, error))
+QStringList remoteBundleArgv() {
+    const auto script = remoteBundleScript();
+    QString quoted = QStringLiteral("'");
+    for (const auto &ch : script) {
+        if (ch == u'\'')
+            quoted += QStringLiteral("'\\''");
+        else
+            quoted += ch;
+    }
+    quoted += u'\'';
+    // OpenSSH joins the remote command for a shell. The quotes are part of
+    // this one argument so the script is not split on spaces.
+    return {"sudo", "-n", "sh", "-c", quoted};
+}
+
+QByteArray remoteBundlePayload(const QVector<QPair<QString, QByteArray>> &files) {
+    QByteArray out;
+    for (const auto &file : files) {
+        out += "FILE " + file.first.toUtf8() + " " + QByteArray::number(file.second.size()) + "\n";
+        out += file.second;
+        out += "\n";
+    }
+    return out;
+}
+
+bool writeRemoteBundle(const QByteArray &payload, const QString &root, QString *error) {
+    int pos = 0;
+    while (pos < payload.size()) {
+        int end = payload.indexOf('\n', pos);
+        if (end < 0)
+            end = payload.size();
+        const auto line = payload.mid(pos, end - pos);
+        pos = end < payload.size() ? end + 1 : payload.size();
+        if (line.isEmpty() || line.startsWith("MISS ") || line.startsWith("SKIP ") || line.startsWith("ERR "))
+            continue;
+        if (!line.startsWith("FILE ")) {
+            if (error && error->isEmpty())
+                *error = "The share file listing was not in the expected form.";
+            return false;
+        }
+        const auto rest = line.mid(5);
+        const int space = rest.lastIndexOf(' ');
+        if (space <= 0) {
+            if (error && error->isEmpty())
+                *error = "The share file listing was not in the expected form.";
+            return false;
+        }
+        const auto path = QString::fromUtf8(rest.left(space));
+        bool sizeOk = false;
+        const int size = rest.mid(space + 1).toInt(&sizeOk);
+        if (!sizeOk || size < 0 || size > 1048576 || pos + size > payload.size()) {
+            if (error && error->isEmpty())
+                *error = "The share file listing was cut off.";
+            return false;
+        }
+        const auto body = payload.mid(pos, size);
+        pos += size;
+        if (pos < payload.size() && payload.at(pos) == '\n')
+            ++pos;
+        if (!bundlePathOk(path))
+            continue;
+        if (!writeBundleFile(root, path, body, error))
             return false;
     }
-    // No glob in the remote command. The login shell would expand it, and the
-    // path check below keeps only exports files.
-    const auto listed = link->exec({"sudo", "-n", "find", "/etc/exports.d", "-maxdepth", "1", "-type", "f"}, {}, 20000);
-    static const QRegularExpression exportPath("^/etc/exports\\.d/[A-Za-z0-9._-]+\\.exports$");
-    if (listed.code == 0) {
-        for (const auto &line : listed.out.split('\n', Qt::SkipEmptyParts)) {
-            const auto path = line.trimmed();
-            if (!exportPath.match(path).hasMatch())
-                continue;
-            if (!pullOne(link, path, root + path, error))
-                return false;
-        }
-    }
     return true;
+}
+
+bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error) {
+    const auto result = link->exec(remoteBundleArgv(), {}, 20000);
+    const auto message = result.err + result.out;
+    if (result.code != 0) {
+        if (message.contains("a password is required") || message.contains("sudo")) {
+            if (error && error->isEmpty())
+                *error = "The SSH user needs passwordless sudo to read the share files.";
+        } else if (error && error->isEmpty()) {
+            *error = message.trimmed().isEmpty() ? QStringLiteral("Could not read the share files.") : message.trimmed();
+        }
+        return false;
+    }
+    return writeRemoteBundle(result.out.toUtf8(), root, error);
 }
 
 bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QStringList &packages, QString *error) {

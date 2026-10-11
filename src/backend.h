@@ -37,11 +37,16 @@ class Backend : public QObject {
     Q_PROPERTY(QString lastOutput READ lastOutput NOTIFY modelChanged)
     Q_PROPERTY(QString createHint READ createHint NOTIFY protocolChanged)
     Q_PROPERTY(bool browsing READ browsing NOTIFY browsingChanged)
+    Q_PROPERTY(bool remote READ remote NOTIFY hostChanged)
+    Q_PROPERTY(QString browsePath READ browsePath NOTIFY browseChanged)
+    Q_PROPERTY(QVariantList browseRows READ browseRows NOTIFY browseChanged)
+    Q_PROPERTY(QString browseFile READ browseFile NOTIFY browseChanged)
     Q_PROPERTY(QString hostTitle READ hostTitle NOTIFY hostChanged)
     Q_PROPERTY(QVariantList hosts READ hosts NOTIFY hostChanged)
     Q_PROPERTY(QString needsText READ needsText NOTIFY hostChanged)
     Q_PROPERTY(bool canInstall READ canInstall NOTIFY hostChanged)
     Q_PROPERTY(bool canTrustHost READ canTrustHost NOTIFY hostChanged)
+    Q_PROPERTY(bool connecting READ connecting NOTIFY hostChanged)
 
 public:
     explicit Backend(const QString &root = {}, Commands *commands = nullptr, FilePicker *picker = nullptr,
@@ -71,11 +76,16 @@ public:
     QString lastOutput() const { return m_lastOutput; }
     QString createHint() const;
     bool browsing() const { return m_browsing; }
+    bool remote() const { return m_mirror != nullptr; }
+    QString browsePath() const { return m_browsePath; }
+    QVariantList browseRows() const { return m_browseRows; }
+    QString browseFile() const { return m_browseFile; }
     QString hostTitle() const { return m_hostTitle; }
     QVariantList hosts() const { return m_hostRows; }
     QString needsText() const { return m_needsText; }
     bool canInstall() const { return m_canInstall; }
     bool canTrustHost() const { return m_canTrustHost; }
+    bool connecting() const { return m_connecting; }
     void setHostsFile(const QString &path) { m_hostsFile = path; }
 
     Q_INVOKABLE void setProtocol(int protocol);
@@ -85,6 +95,11 @@ public:
     Q_INVOKABLE void toggleEnabled();
     Q_INVOKABLE bool create(const QString &name, const QString &path);
     Q_INVOKABLE void browseForCreate(const QString &currentPath = {}, const QString &currentName = {});
+    Q_INVOKABLE void browseEnter(int index);
+    Q_INVOKABLE void browseUp();
+    Q_INVOKABLE bool browseMake(const QString &name);
+    Q_INVOKABLE void browseChoose(const QString &fileName);
+    Q_INVOKABLE void browseCancel();
     Q_INVOKABLE void removeSelected();
     Q_INVOKABLE void undo();
     Q_INVOKABLE void redo();
@@ -103,8 +118,9 @@ public:
     Q_INVOKABLE bool createAccess(const QString &backend, const QString &name, const QString &secret);
     Q_INVOKABLE bool removeAccess(const QString &backend, const QString &name);
     Q_INVOKABLE void refreshHosts();
-    Q_INVOKABLE bool useHost(const QString &id);
+    Q_INVOKABLE bool useHost(const QString &id, const QString &user = {});
     Q_INVOKABLE bool addHost(const QString &user, const QString &host, int port);
+    Q_INVOKABLE bool leaveComputer();
     Q_INVOKABLE bool installNeeds();
     Q_INVOKABLE bool trustHost();
 
@@ -115,9 +131,11 @@ signals:
     void errorChanged();
     void dirtyChanged();
     void browsingChanged();
+    void browseChanged();
     void createPathChosen(const QString &path);
     void hostChanged();
     void needsReady();
+    void computerReady();
 
 private:
     struct Snapshot {
@@ -144,12 +162,54 @@ private:
     void pushUndo();
     void selectNearby(int index);
     void assignIds();
+    struct LiveStatus {
+        int wave = 0;
+        QString sambaState;
+        QString nfsState;
+        QString iscsiState;
+        QStringList reachable;
+        QString tailscaleStatus;
+        QVector<Account> users;
+    };
+    struct S3Status {
+        int wave = 0;
+        QString state;
+        QStringList backends;
+        S3Config config;
+        QString notice;
+    };
+    struct ConnectResult {
+        int wave = 0;
+        RemoteNeed need;
+        QByteArray bundle;
+        QString pullError;
+        bool haveBundle = false;
+        RemoteHost host;
+    };
+
     void copyFromLibrary();
+    void finishReload(int wave, const QString &pullError);
+    void scheduleStatus(int wave);
+    void applyLiveStatus(const LiveStatus &status);
+    void ensureS3();
+    void refreshS3();
+    void scheduleS3(int wave);
+    void applyS3(const S3Status &status);
+    void adoptS3();
+    void ensureSessions(int protocol);
+    void applySessions(int wave, int protocol, const QStringList &sessions);
+    void scheduleRemoteReload(int wave);
+    bool beginConnect(const RemoteHost &host);
+    void applyConnect(const ConnectResult &result, const std::shared_ptr<RemoteLink> &link);
+    std::shared_ptr<Commands> liveCommands() const;
     void touch();
     void setDirty(bool dirty);
     void setError(const QString &error);
     void setBrowsing(bool browsing);
     void connectPicker();
+    bool beginRemoteBrowse(const QString &path);
+    bool openRemoteBrowse(const QString &path);
+    static QString childPath(const QString &dir, const QString &name);
     void acceptPickedPath(const QString &path);
     bool runPlan(const Plan &plan, QString *output = nullptr);
     bool commitWithPkexec(const Plan &plan, QString *error, QString *output);
@@ -159,18 +219,27 @@ private:
     void writeSavedHosts() const;
     void publishHosts();
     bool connectRemote(const RemoteHost &host);
+    bool connectRemoteUser(const RemoteHost &host);
     void useLocal();
     QString localUser() const;
     RemoteHost hostById(const QString &id) const;
 
-    std::unique_ptr<Commands> m_owned;
+    std::shared_ptr<Commands> m_owned;
     Commands *m_localCommands = nullptr;
     Commands *m_commands = nullptr;
-    std::unique_ptr<RemoteLink> m_ownedLink;
+    std::shared_ptr<RemoteLink> m_linkShared;
     RemoteLink *m_link = nullptr;
     RemoteLink *m_injectedLink = nullptr;
-    std::unique_ptr<RemoteCommands> m_remoteCommands;
+    std::shared_ptr<RemoteCommands> m_remoteCommands;
     std::unique_ptr<QTemporaryDir> m_mirror;
+    // Real process runs move probes off the caller. Injected test doubles stay
+    // on the caller so a test can read the result on the next line.
+    bool m_deferProbes = false;
+    int m_wave = 0;
+    int m_s3Wave = 0;
+    int m_hostWave = 0;
+    bool m_s3Ready = false;
+    bool m_sessionsReady[3] = {false, false, false};
     QString m_appRoot;
     QString m_hostsFile;
     QString m_hostTitle = QStringLiteral("This computer");
@@ -181,6 +250,9 @@ private:
     bool m_pendingTailscaleSsh = false;
     bool m_canInstall = false;
     bool m_canTrustHost = false;
+    bool m_connecting = false;
+    bool m_trustNextConnect = false;
+    QString m_restoreTitle;
     QVariantList m_hostRows;
     QVector<RemoteHost> m_saved;
     QVector<RemoteHost> m_peers;
@@ -213,6 +285,9 @@ private:
     QString m_notice;
     QString m_lastOutput;
     bool m_browsing = false;
+    QString m_browsePath;
+    QVariantList m_browseRows;
+    QString m_browseFile;
     std::unique_ptr<FilePicker> m_ownedPicker;
     FilePicker *m_picker = nullptr;
     QVector<Snapshot> m_undo;

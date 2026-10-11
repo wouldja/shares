@@ -3,6 +3,8 @@
 #include "portalfilepicker.h"
 #include "remote.h"
 
+#include <algorithm>
+
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDate>
@@ -13,10 +15,14 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPointer>
 #include <QSaveFile>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QThreadPool>
+
+#include <utility>
 
 namespace {
 
@@ -193,13 +199,39 @@ QString imageName(const QString &currentPath, const QString &currentName) {
     return QStringLiteral("disk.img");
 }
 
+// OpenSSH joins the remote command and a shell parses it. One pair of single
+// quotes keeps spaces and $() inside a path from becoming more arguments.
+QString quoteShell(const QString &text) {
+    QString quoted = QStringLiteral("'");
+    for (const auto &ch : text) {
+        if (ch == u'\'')
+            quoted += QStringLiteral("'\\''");
+        else
+            quoted += ch;
+    }
+    quoted += u'\'';
+    return quoted;
+}
+
+bool folderNameOk(const QString &name) {
+    return !name.isEmpty() && name != QStringLiteral(".") && name != QStringLiteral("..") && !name.contains('/')
+        && !name.contains('\n') && !name.contains('\r');
+}
+
+QString parentPath(const QString &path) {
+    if (path == QStringLiteral("/"))
+        return path;
+    const auto slash = path.lastIndexOf('/');
+    return slash > 0 ? path.left(slash) : QStringLiteral("/");
+}
+
 } // namespace
 
 Backend::Backend(const QString &root, Commands *commands, FilePicker *picker, RemoteLink *link, QObject *parent)
-    : QObject(parent), m_owned(commands ? nullptr : std::make_unique<Commands>()),
+    : QObject(parent), m_owned(commands ? nullptr : std::make_shared<Commands>()),
       m_localCommands(commands ? commands : m_owned.get()), m_commands(m_localCommands), m_link(link),
-      m_injectedLink(link), m_appRoot(cleanRoot(root)), m_root(m_appRoot), m_library(m_root, m_commands),
-      m_picker(picker) {
+      m_injectedLink(link), m_deferProbes(commands == nullptr), m_appRoot(cleanRoot(root)), m_root(m_appRoot),
+      m_library(m_root, m_commands), m_picker(picker) {
     if (m_picker)
         connectPicker();
     if (m_appRoot == "/") {
@@ -223,6 +255,14 @@ Backend::Backend(const QString &root, Commands *commands, FilePicker *picker, Re
 }
 
 void Backend::reload() {
+    const int wave = ++m_wave;
+    ++m_s3Wave;
+    m_s3Ready = false;
+    m_sessionsReady[0] = m_sessionsReady[1] = m_sessionsReady[2] = false;
+    if (m_mirror && m_link && m_deferProbes) {
+        scheduleRemoteReload(wave);
+        return;
+    }
     QString pullError;
     if (m_mirror && m_link) {
         if (!pullRemoteFiles(m_link, m_mirror->path(), &pullError)) {
@@ -231,7 +271,26 @@ void Backend::reload() {
         m_library.setRoot(m_mirror->path());
         m_root = m_mirror->path();
     }
-    m_library.load();
+    finishReload(wave, pullError);
+}
+
+void Backend::finishReload(int wave, const QString &pullError) {
+    if (wave != m_wave)
+        return;
+    // Config files are local and small. Publish them before the process probes
+    // so the window is up while systemctl, tailscale, and SSH are still running.
+    m_library.loadFiles();
+    if (m_deferProbes) {
+        m_library.sambaState = QStringLiteral("checking");
+        m_library.nfsState = QStringLiteral("checking");
+        m_library.iscsiState = QStringLiteral("checking");
+        m_library.s3State = QStringLiteral("checking");
+        m_library.reachable.clear();
+        m_library.users.clear();
+        m_library.tailscaleStatus.clear();
+    } else {
+        m_library.loadStatus();
+    }
     copyFromLibrary();
     m_filter.clear();
     m_undo.clear();
@@ -241,6 +300,12 @@ void Backend::reload() {
     emit dirtyChanged();
     emit historyChanged();
     touch();
+    if (m_protocol == 3)
+        ensureS3();
+    else
+        ensureSessions(m_protocol);
+    if (m_deferProbes)
+        scheduleStatus(wave);
 }
 
 void Backend::copyFromLibrary() {
@@ -262,7 +327,182 @@ void Backend::copyFromLibrary() {
     m_dirty = m_library.smbHadShares;
     m_lastOutput.clear();
     assignIds();
-    refreshHosts();
+    m_peers = tailscalePeers(m_library.tailscaleStatus);
+    publishHosts();
+}
+
+std::shared_ptr<Commands> Backend::liveCommands() const {
+    if (m_remoteCommands)
+        return m_remoteCommands;
+    return m_owned;
+}
+
+void Backend::scheduleStatus(int wave) {
+    auto commands = liveCommands();
+    if (!commands)
+        return;
+    const auto profile = m_library.profile();
+    const bool clustered = m_library.iscsi.clustered;
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([commands, profile, clustered, wave, self] {
+        Library library(QStringLiteral("/"), commands.get());
+        library.setProfile(profile);
+        library.iscsi.clustered = clustered;
+        library.loadStatus();
+        LiveStatus status;
+        status.wave = wave;
+        status.sambaState = library.sambaState;
+        status.nfsState = library.nfsState;
+        status.iscsiState = library.iscsiState;
+        status.reachable = library.reachable;
+        status.tailscaleStatus = library.tailscaleStatus;
+        status.users = library.users;
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(app, [self, status] {
+            if (!self || status.wave != self->m_wave)
+                return;
+            self->applyLiveStatus(status);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Backend::applyLiveStatus(const LiveStatus &status) {
+    m_library.sambaState = status.sambaState;
+    m_library.nfsState = status.nfsState;
+    m_library.iscsiState = status.iscsiState;
+    m_library.reachable = status.reachable;
+    m_library.tailscaleStatus = status.tailscaleStatus;
+    m_library.users = status.users;
+    m_sambaState = status.sambaState;
+    m_nfsState = status.nfsState;
+    m_iscsiState = status.iscsiState;
+    m_reachable = status.reachable;
+    m_users = status.users;
+    m_peers = tailscalePeers(status.tailscaleStatus);
+    publishHosts();
+    touch();
+}
+
+void Backend::ensureSessions(int protocol) {
+    if (protocol < 0 || protocol > 2 || m_sessionsReady[protocol])
+        return;
+    if (!m_deferProbes) {
+        m_library.loadSessions(protocol);
+        m_sambaSessions = m_library.sambaSessions;
+        m_nfsSessions = m_library.nfsSessions;
+        m_iscsiSessions = m_library.iscsiSessions;
+        m_sessionsReady[protocol] = true;
+        touch();
+        return;
+    }
+    auto commands = liveCommands();
+    if (!commands)
+        return;
+    const int wave = m_wave;
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([commands, protocol, wave, self] {
+        Library library(QStringLiteral("/"), commands.get());
+        library.loadSessions(protocol);
+        QStringList sessions = protocol == 0 ? library.sambaSessions : protocol == 1 ? library.nfsSessions : library.iscsiSessions;
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(app, [self, wave, protocol, sessions] {
+            if (!self)
+                return;
+            self->applySessions(wave, protocol, sessions);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Backend::applySessions(int wave, int protocol, const QStringList &sessions) {
+    if (wave != m_wave || protocol < 0 || protocol > 2)
+        return;
+    if (protocol == 0)
+        m_sambaSessions = sessions;
+    else if (protocol == 1)
+        m_nfsSessions = sessions;
+    else
+        m_iscsiSessions = sessions;
+    m_sessionsReady[protocol] = true;
+    touch();
+}
+
+void Backend::ensureS3() {
+    if (m_s3Ready)
+        return;
+    if (m_deferProbes) {
+        if (m_s3State != QStringLiteral("checking")) {
+            m_s3State = QStringLiteral("checking");
+            touch();
+        }
+        scheduleS3(m_s3Wave);
+        return;
+    }
+    m_library.loadS3();
+    adoptS3();
+}
+
+void Backend::refreshS3() {
+    m_s3Ready = false;
+    ++m_s3Wave;
+    ensureS3();
+}
+
+void Backend::scheduleS3(int wave) {
+    auto commands = liveCommands();
+    if (!commands)
+        return;
+    const auto root = m_root;
+    const auto endpoint = m_library.rustfsEndpoint;
+    const auto profile = m_library.profile();
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([commands, root, endpoint, profile, wave, self] {
+        Library library(root, commands.get());
+        library.setProfile(profile);
+        library.rustfsEndpoint = endpoint;
+        library.loadS3();
+        S3Status status;
+        status.wave = wave;
+        status.state = library.s3State;
+        status.backends = library.s3Backends;
+        status.config = library.s3;
+        status.notice = library.notice;
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(app, [self, status] {
+            if (!self)
+                return;
+            self->applyS3(status);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Backend::applyS3(const S3Status &status) {
+    if (status.wave != m_s3Wave)
+        return;
+    m_library.s3 = status.config;
+    m_library.s3Backends = status.backends;
+    m_library.s3State = status.state;
+    if (!status.notice.isEmpty() && !m_library.notice.contains(status.notice))
+        m_library.notice += (m_library.notice.isEmpty() ? QString() : QStringLiteral(" ")) + status.notice;
+    adoptS3();
+}
+
+void Backend::adoptS3() {
+    m_s3 = m_library.s3;
+    m_s3Backends = m_library.s3Backends;
+    m_s3State = m_library.s3State;
+    m_notice = m_library.notice;
+    m_ids[3].clear();
+    for (int i = 0; i < m_s3.buckets.size(); ++i)
+        m_ids[3].append(m_nextId++);
+    m_selected[3] = m_ids[3].isEmpty() ? -1 : m_ids[3].first();
+    m_s3Ready = true;
+    touch();
 }
 
 void Backend::assignIds() {
@@ -628,6 +868,10 @@ void Backend::setProtocol(int protocol) {
     m_protocol = protocol;
     m_filter.clear();
     emit protocolChanged();
+    if (protocol == 3)
+        ensureS3();
+    else
+        ensureSessions(protocol);
     touch();
 }
 
@@ -750,11 +994,90 @@ void Backend::acceptPickedPath(const QString &path) {
     emit createPathChosen(path);
 }
 
+QString Backend::childPath(const QString &dir, const QString &name) {
+    if (dir == QStringLiteral("/"))
+        return QStringLiteral("/") + name;
+    return dir + QStringLiteral("/") + name;
+}
+
+bool Backend::openRemoteBrowse(const QString &path) {
+    if (!m_link || !absolutePathOk(path)) {
+        setError(QStringLiteral("That folder is not on this computer."));
+        return false;
+    }
+    const auto quoted = quoteShell(path);
+    const auto check = m_link->exec({QStringLiteral("test"), QStringLiteral("-d"), quoted}, {}, 8000);
+    if (check.code != 0) {
+        const auto message = check.err.trimmed();
+        setError(message.isEmpty() ? QStringLiteral("That folder is not on this computer.") : message);
+        return false;
+    }
+    const auto listed = m_link->exec({QStringLiteral("ls"), QStringLiteral("-1"), QStringLiteral("-A"), QStringLiteral("-p"),
+                                      QStringLiteral("--color=never"), QStringLiteral("--quoting-style=literal"),
+                                      QStringLiteral("--"), quoted},
+                                     {}, 20000);
+    if (listed.code != 0) {
+        const auto message = listed.err.trimmed().isEmpty() ? listed.out.trimmed() : listed.err.trimmed();
+        setError(message.isEmpty() ? QStringLiteral("That folder could not be listed.") : message);
+        return false;
+    }
+    struct Row {
+        QString name;
+        bool dir = false;
+    };
+    QVector<Row> rows;
+    for (auto line : listed.out.split('\n')) {
+        line = line.trimmed();
+        if (line.isEmpty())
+            continue;
+        const bool dir = line.endsWith('/');
+        if (dir)
+            line.chop(1);
+        if (line.isEmpty() || line == QStringLiteral(".") || line == QStringLiteral("..") || line.contains('/'))
+            continue;
+        rows.append({line, dir});
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+        if (a.dir != b.dir)
+            return a.dir;
+        return a.name.localeAwareCompare(b.name) < 0;
+    });
+    m_browseRows.clear();
+    for (const auto &row : rows)
+        m_browseRows.append(QVariantMap{{"name", row.name}, {"dir", row.dir}});
+    m_browsePath = path;
+    setError({});
+    emit browseChanged();
+    return true;
+}
+
+bool Backend::beginRemoteBrowse(const QString &path) {
+    if (openRemoteBrowse(path))
+        return true;
+    const auto parent = parentPath(path);
+    if (parent != path && openRemoteBrowse(parent))
+        return true;
+    if (parent != QStringLiteral("/") && openRemoteBrowse(QStringLiteral("/")))
+        return true;
+    return false;
+}
+
 void Backend::browseForCreate(const QString &currentPath, const QString &currentName) {
     if (m_browsing)
         return;
     if (m_protocol == 3) {
         setError(QStringLiteral("S3 buckets have no folder. Name the backend instead."));
+        return;
+    }
+    if (remote()) {
+        m_browseFile = m_protocol == 2 ? imageName(currentPath, currentName) : QString();
+        QString path = QStringLiteral("/");
+        if (absolutePathOk(currentPath))
+            path = m_protocol == 2 ? parentPath(currentPath) : currentPath;
+        if (!beginRemoteBrowse(path))
+            return;
+        setBrowsing(true);
+        emit browseChanged();
         return;
     }
     if (!m_picker) {
@@ -771,10 +1094,76 @@ void Backend::browseForCreate(const QString &currentPath, const QString &current
                                folder);
 }
 
+void Backend::browseEnter(int index) {
+    if (!m_browsing || !remote() || index < 0 || index >= m_browseRows.size())
+        return;
+    const auto row = m_browseRows.at(index).toMap();
+    const auto path = childPath(m_browsePath, row.value("name").toString());
+    if (row.value("dir").toBool()) {
+        openRemoteBrowse(path);
+        return;
+    }
+    if (m_protocol == 2) {
+        acceptPickedPath(path);
+        return;
+    }
+    setError(QStringLiteral("That is a file. Use this folder, or open a directory."));
+}
+
+void Backend::browseUp() {
+    if (!m_browsing || !remote())
+        return;
+    openRemoteBrowse(parentPath(m_browsePath));
+}
+
+bool Backend::browseMake(const QString &name) {
+    if (!m_browsing || !remote() || !m_link)
+        return false;
+    const auto folder = name.trimmed();
+    if (!folderNameOk(folder)) {
+        setError(QStringLiteral("A folder name cannot include / or be empty."));
+        return false;
+    }
+    const auto path = childPath(m_browsePath, folder);
+    if (!absolutePathOk(path)) {
+        setError(QStringLiteral("A share path has to be an absolute path."));
+        return false;
+    }
+    const auto made = m_link->exec({QStringLiteral("mkdir"), QStringLiteral("--"), quoteShell(path)}, {}, 20000);
+    if (made.code != 0) {
+        const auto message = made.err.trimmed().isEmpty() ? made.out.trimmed() : made.err.trimmed();
+        setError(message.isEmpty() ? QStringLiteral("Could not create that folder.") : message);
+        return false;
+    }
+    openRemoteBrowse(m_browsePath);
+    return true;
+}
+
+void Backend::browseChoose(const QString &fileName) {
+    if (!m_browsing || !remote())
+        return;
+    auto path = m_browsePath;
+    if (m_protocol == 2) {
+        const auto file = fileName.trimmed();
+        if (!folderNameOk(file)) {
+            setError(QStringLiteral("A disk image needs a file name."));
+            return;
+        }
+        path = childPath(m_browsePath, file);
+    }
+    acceptPickedPath(path);
+}
+
+void Backend::browseCancel() { setBrowsing(false); }
+
 bool Backend::create(const QString &name, const QString &path) {
     const auto trimmedName = name.trimmed();
     const auto trimmedPath = path.trimmed();
     if (m_protocol == 3) {
+        if (m_deferProbes && !m_s3Ready) {
+            setError(QStringLiteral("S3 is still loading."));
+            return false;
+        }
         const auto backend = trimmedPath.isEmpty() && m_s3Backends.size() == 1 ? m_s3Backends.first() : trimmedPath;
         if (!knownBackend(backend)) {
             setError(m_s3Backends.isEmpty() ? QStringLiteral("No S3 backend is installed.") : QStringLiteral("Name the backend: minio, garage, ceph, or rustfs."));
@@ -794,6 +1183,7 @@ bool Backend::create(const QString &name, const QString &path) {
         m_ids[3].append(m_nextId++);
         m_selected[3] = m_ids[3].last();
         touch();
+        refreshS3();
         return true;
     }
     if (m_protocol == 0) {
@@ -911,6 +1301,7 @@ void Backend::removeSelected() {
         m_ids[3].removeAt(index);
         selectNearby(index);
         touch();
+        refreshS3();
         return;
     }
     pushUndo();
@@ -1456,6 +1847,7 @@ bool Backend::createAccess(const QString &backend, const QString &name, const QS
     m_lastOutput = output.left(4000);
     m_s3.access.append({which, name.trimmed(), which == "garage" ? QStringLiteral("key") : QStringLiteral("user")});
     touch();
+    refreshS3();
     return true;
 }
 
@@ -1481,6 +1873,7 @@ bool Backend::removeAccess(const QString &backend, const QString &name) {
             m_s3.access.removeAt(i);
     }
     touch();
+    refreshS3();
     return true;
 }
 
@@ -1634,6 +2027,7 @@ void Backend::publishHosts() {
                               {"via", ""}};
     for (const auto &peer : m_peers) {
         auto detail = peer.host;
+        detail += QStringLiteral(" · ") + (peer.user.isEmpty() ? localUser() : peer.user);
         detail += peer.tailscaleSsh ? QStringLiteral(" · Tailscale SSH") : QStringLiteral(" · tailscale");
         m_hostRows << QVariantMap{{"id", "ts:" + peer.host}, {"name", peer.name}, {"detail", detail}, {"via", "tailscale"}};
     }
@@ -1647,9 +2041,31 @@ void Backend::publishHosts() {
 }
 
 void Backend::refreshHosts() {
-    const auto status = m_localCommands->run("tailscale", {"status", "--json"});
-    m_peers = !status.missing && status.code == 0 ? tailscalePeers(status.out) : QVector<RemoteHost>{};
-    publishHosts();
+    auto apply = [this](const CommandResult &status) {
+        m_library.tailscaleStatus = (!status.missing && status.code == 0) ? status.out : QString();
+        m_peers = tailscalePeers(m_library.tailscaleStatus);
+        publishHosts();
+    };
+    if (!m_deferProbes || !m_owned) {
+        apply(m_localCommands->run("tailscale", {"status", "--json"}, {}, m_localCommands->probeTimeoutMs()));
+        return;
+    }
+    auto commands = m_owned;
+    const int wave = ++m_hostWave;
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([commands, wave, self] {
+        const auto status = commands->run("tailscale", {"status", "--json"}, {}, commands->probeTimeoutMs());
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(app, [self, wave, status] {
+            if (!self || wave != self->m_hostWave)
+                return;
+            self->m_library.tailscaleStatus = (!status.missing && status.code == 0) ? status.out : QString();
+            self->m_peers = tailscalePeers(self->m_library.tailscaleStatus);
+            self->publishHosts();
+        }, Qt::QueuedConnection);
+    });
 }
 
 RemoteHost Backend::hostById(const QString &id) const {
@@ -1670,10 +2086,205 @@ RemoteHost Backend::hostById(const QString &id) const {
     return {};
 }
 
+bool Backend::beginConnect(const RemoteHost &host) {
+    auto target = host;
+    if (target.user.isEmpty())
+        target.user = localUser();
+    if (!m_injectedLink && !remoteTargetOk(target.user, target.host, target.port)) {
+        m_trustNextConnect = false;
+        setError(QStringLiteral("That computer needs a user and a plain host name."));
+        return false;
+    }
+    const int wave = ++m_wave;
+    ++m_s3Wave;
+    m_s3Ready = false;
+    m_sessionsReady[0] = m_sessionsReady[1] = m_sessionsReady[2] = false;
+    m_restoreTitle = m_hostTitle;
+    m_connecting = true;
+    const bool trustNext = m_trustNextConnect;
+    m_trustNextConnect = false;
+    m_pendingUser = target.user;
+    m_pendingHost = target.host;
+    m_pendingPort = target.port;
+    m_pendingTailscaleSsh = target.tailscaleSsh;
+    const auto label = target.name.isEmpty() ? target.host : target.name;
+    m_hostTitle = QStringLiteral("Connecting to %1").arg(label);
+    m_notice = QStringLiteral("Reading the share files.");
+    m_canInstall = false;
+    m_canTrustHost = false;
+    emit hostChanged();
+    touch();
+
+    const auto login = localUser();
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([target, login, wave, trustNext, self] {
+        auto attempt = [trustNext](RemoteHost candidate) {
+            auto link = std::make_shared<SshLink>(candidate.user, candidate.host, candidate.port, candidate.tailscaleSsh);
+            if (trustNext)
+                link->trustNextKey();
+            return std::pair<std::shared_ptr<RemoteLink>, RemoteNeed>(link, probeRemote(link.get()));
+        };
+        auto tried = attempt(target);
+        auto chosen = target;
+        const auto denied = QStringLiteral("does not permit you to SSH as user");
+        if (!tried.second.connected && tried.second.error.contains(denied) && chosen.user == login
+            && chosen.user != QStringLiteral("root")) {
+            auto root = chosen;
+            root.user = QStringLiteral("root");
+            const auto firstError = tried.second.error;
+            tried = attempt(root);
+            chosen = root;
+            if (!tried.second.connected && tried.second.error.contains(denied))
+                tried.second.error = firstError + QStringLiteral("\nType the SSH user this tailnet allows. Root was refused too.");
+        }
+        ConnectResult result;
+        result.wave = wave;
+        result.need = tried.second;
+        result.host = chosen;
+        if (result.need.connected) {
+            const auto pulled = tried.first->exec(remoteBundleArgv(), {}, 20000);
+            const auto message = pulled.err + pulled.out;
+            if (pulled.code != 0) {
+                if (message.contains(QStringLiteral("a password is required")) || message.contains(QStringLiteral("sudo")))
+                    result.pullError = QStringLiteral("The SSH user needs passwordless sudo to read the share files.");
+                else
+                    result.pullError = message.trimmed().isEmpty() ? QStringLiteral("Could not read the share files.")
+                                                                   : message.trimmed();
+            } else {
+                result.haveBundle = true;
+                result.bundle = pulled.out.toUtf8();
+            }
+        }
+        auto link = tried.first;
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app, [self, result, link] {
+                if (!self)
+                    return;
+                self->applyConnect(result, link);
+            },
+            Qt::QueuedConnection);
+    });
+    return true;
+}
+
+void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<RemoteLink> &link) {
+    if (result.wave != m_wave)
+        return;
+    m_pendingUser = result.host.user;
+    m_pendingHost = result.host.host;
+    m_pendingPort = result.host.port;
+    m_pendingTailscaleSsh = result.host.tailscaleSsh;
+    m_connecting = false;
+    if (!result.need.connected) {
+        // A failed first connection has no mirror. A failed switch leaves the
+        // computer that was already open, including its SSH link.
+        if (!m_mirror) {
+            m_linkShared.reset();
+            m_link = m_injectedLink;
+            m_commands = m_localCommands;
+            m_library.setCommands(m_commands);
+            m_hostTitle = QStringLiteral("This computer");
+        } else {
+            m_hostTitle = m_restoreTitle.isEmpty() ? QStringLiteral("This computer") : m_restoreTitle;
+        }
+        m_notice = m_library.notice;
+        m_canTrustHost = result.need.hostKeyDenied;
+        m_canInstall = false;
+        m_needsText.clear();
+        setError(result.need.error);
+        emit hostChanged();
+        touch();
+        return;
+    }
+    m_linkShared = link;
+    m_link = link.get();
+    m_mirror = std::make_unique<QTemporaryDir>();
+    if (!m_mirror->isValid()) {
+        setError(QStringLiteral("Could not keep a local copy of that computer."));
+        m_hostTitle = QStringLiteral("This computer");
+        emit hostChanged();
+        return;
+    }
+    QString pullError = result.pullError;
+    if (result.haveBundle)
+        writeRemoteBundle(result.bundle, m_mirror->path(), &pullError);
+    m_remoteCommands = std::make_shared<RemoteCommands>(m_link);
+    m_commands = m_remoteCommands.get();
+    m_library.setCommands(m_commands);
+    m_library.setProfile(result.need.profile);
+    m_library.setRoot(m_mirror->path());
+    m_root = m_mirror->path();
+    m_remoteProfile = result.need.profile;
+    m_hostTitle = result.host.name.isEmpty() ? result.host.host : result.host.name;
+    m_neededPackages = result.need.packages;
+    m_canInstall = result.need.sudo && !result.need.packages.isEmpty();
+    m_canTrustHost = false;
+    if (!result.need.sudo)
+        m_needsText = result.need.error + QStringLiteral("\n\n") + result.need.command;
+    else if (!result.need.packages.isEmpty())
+        m_needsText = QStringLiteral("These packages are missing on %1:\n").arg(m_hostTitle) + result.need.command;
+    else
+        m_needsText.clear();
+    finishReload(result.wave, pullError);
+    m_connecting = false;
+    if (!result.need.sudo)
+        setError(result.need.error);
+    if (!m_needsText.isEmpty())
+        emit needsReady();
+    emit hostChanged();
+    emit computerReady();
+}
+
+void Backend::scheduleRemoteReload(int wave) {
+    auto link = m_linkShared;
+    if (!link) {
+        finishReload(wave, QStringLiteral("Could not read the share files."));
+        return;
+    }
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([link, wave, self] {
+        QString pullError;
+        QByteArray bundle;
+        bool haveBundle = false;
+        const auto result = link->exec(remoteBundleArgv(), {}, 20000);
+        const auto message = result.err + result.out;
+        if (result.code != 0) {
+            if (message.contains(QStringLiteral("a password is required")) || message.contains(QStringLiteral("sudo")))
+                pullError = QStringLiteral("The SSH user needs passwordless sudo to read the share files.");
+            else
+                pullError = message.trimmed().isEmpty() ? QStringLiteral("Could not read the share files.") : message.trimmed();
+        } else {
+            haveBundle = true;
+            bundle = result.out.toUtf8();
+        }
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app, [self, wave, bundle, haveBundle, pullError] {
+                if (!self || wave != self->m_wave || !self->m_mirror)
+                    return;
+                QString error = pullError;
+                if (haveBundle)
+                    writeRemoteBundle(bundle, self->m_mirror->path(), &error);
+                self->m_library.setRoot(self->m_mirror->path());
+                self->m_root = self->m_mirror->path();
+                self->finishReload(wave, error);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void Backend::useLocal() {
+    ++m_wave;
+    ++m_s3Wave;
+    m_connecting = false;
     m_mirror.reset();
     m_remoteCommands.reset();
-    m_ownedLink.reset();
+    m_linkShared.reset();
     m_link = m_injectedLink;
     m_commands = m_localCommands;
     m_library.setCommands(m_commands);
@@ -1692,13 +2303,40 @@ bool Backend::connectRemote(const RemoteHost &host) {
     auto target = host;
     if (target.user.isEmpty())
         target.user = localUser();
+    if (m_deferProbes)
+        return beginConnect(target);
+    if (connectRemoteUser(target))
+        return true;
+    // A tailnet often allows root and rejects the login running this window.
+    // Retry that once. A user typed in the box is left as they wrote it.
+    const auto denied = m_error;
+    if (denied.contains(QStringLiteral("does not permit you to SSH as user")) && target.user == localUser()
+        && target.user != QStringLiteral("root")) {
+        target.user = QStringLiteral("root");
+        if (connectRemoteUser(target))
+            return true;
+        if (m_error.contains(QStringLiteral("does not permit you to SSH as user"))) {
+            setError(denied + QStringLiteral("\nType the SSH user this tailnet allows. Root was refused too."));
+        }
+    }
+    return false;
+}
+
+bool Backend::connectRemoteUser(const RemoteHost &host) {
+    auto target = host;
+    if (target.user.isEmpty())
+        target.user = localUser();
     if (!m_injectedLink) {
         if (!remoteTargetOk(target.user, target.host, target.port)) {
             setError(QStringLiteral("That computer needs a user and a plain host name."));
             return false;
         }
-        m_ownedLink = std::make_unique<SshLink>(target.user, target.host, target.port, target.tailscaleSsh);
-        m_link = m_ownedLink.get();
+        m_linkShared = std::make_shared<SshLink>(target.user, target.host, target.port, target.tailscaleSsh);
+        m_link = m_linkShared.get();
+        if (m_trustNextConnect) {
+            static_cast<SshLink *>(m_link)->trustNextKey();
+            m_trustNextConnect = false;
+        }
     }
     m_pendingUser = target.user;
     m_pendingHost = target.host;
@@ -1718,7 +2356,7 @@ bool Backend::connectRemote(const RemoteHost &host) {
         setError(QStringLiteral("Could not keep a local copy of that computer."));
         return false;
     }
-    m_remoteCommands = std::make_unique<RemoteCommands>(m_link);
+    m_remoteCommands = std::make_shared<RemoteCommands>(m_link);
     m_commands = m_remoteCommands.get();
     m_library.setCommands(m_commands);
     m_library.setProfile(need.profile);
@@ -1738,23 +2376,36 @@ bool Backend::connectRemote(const RemoteHost &host) {
         setError(need.error);
     if (!m_needsText.isEmpty())
         emit needsReady();
+    emit computerReady();
     return true;
 }
 
-bool Backend::useHost(const QString &id) {
-    if (m_dirty) {
+bool Backend::useHost(const QString &id, const QString &user) {
+    // Shares found in smb.conf mark the window unsaved as soon as it connects.
+    // Leaving writes nothing, so that flag cannot trap the window on that
+    // computer. An edit still has an undo entry, and that still waits.
+    if (m_dirty && !m_undo.isEmpty()) {
         setError(QStringLiteral("Save or discard changes before switching computers."));
         return false;
     }
     if (id.isEmpty() || id == "local") {
         useLocal();
         reload();
+        emit computerReady();
         return true;
     }
-    const auto host = hostById(id);
+    auto host = hostById(id);
     if (host.host.isEmpty()) {
         setError(QStringLiteral("That computer is not in the list."));
         return false;
+    }
+    const auto chosen = user.trimmed();
+    if (!chosen.isEmpty()) {
+        if (!accountNameOk(chosen)) {
+            setError(QStringLiteral("The SSH user has to be a lowercase account name."));
+            return false;
+        }
+        host.user = chosen;
     }
     return connectRemote(host);
 }
@@ -1767,7 +2418,7 @@ bool Backend::addHost(const QString &user, const QString &hostName, int port) {
         setError(QStringLiteral("Use a plain user, host, and port. Shares keeps the SSH key you already have."));
         return false;
     }
-    if (m_dirty) {
+    if (m_dirty && !m_undo.isEmpty()) {
         setError(QStringLiteral("Save or discard changes before switching computers."));
         return false;
     }
@@ -1791,8 +2442,21 @@ bool Backend::addHost(const QString &user, const QString &hostName, int port) {
     return connectRemote(remote);
 }
 
+bool Backend::leaveComputer() {
+    if (!remote())
+        return true;
+    if (m_browsing)
+        setBrowsing(false);
+    useLocal();
+    reload();
+    return true;
+}
+
 bool Backend::installNeeds() {
-    if (m_dirty) {
+    // Shares out of smb.conf mark the window unsaved as soon as it connects.
+    // Saving that migration starts smbd, so the flag cannot block the install
+    // that provides smbd. An edit still has an undo entry, and that still waits.
+    if (m_dirty && !m_undo.isEmpty()) {
         setError(QStringLiteral("Save or discard changes before installing packages."));
         return false;
     }
@@ -1832,8 +2496,9 @@ bool Backend::installNeeds() {
 bool Backend::trustHost() {
     if (!m_canTrustHost)
         return false;
-    if (auto *ssh = dynamic_cast<SshLink *>(m_ownedLink.get()))
-        ssh->trustNextKey();
+    // The next SshLink is created inside the connect. The flag has to ride
+    // along, because the link that just failed is replaced before it runs again.
+    m_trustNextConnect = true;
     RemoteHost host;
     host.user = m_pendingUser;
     host.host = m_pendingHost;

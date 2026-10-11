@@ -16,7 +16,12 @@ struct CommandResult {
 class Commands {
 public:
     virtual ~Commands();
-    virtual CommandResult run(const QString &program, const QStringList &args, const QString &input = {});
+    // timeoutMs bounds waitForFinished. Probes pass a short value. Saves keep the default.
+    // run() has no shared mutable state, so parallelProbes() may call it from several threads.
+    virtual CommandResult run(const QString &program, const QStringList &args, const QString &input = {},
+                              int timeoutMs = 8000);
+    virtual bool parallelProbes() const { return true; }
+    virtual int probeTimeoutMs() const { return 2500; }
 };
 
 struct PlannedCommand {
@@ -51,7 +56,12 @@ class Library {
 public:
     Library(QString root, Commands *commands);
 
-    void load();
+    // File reads only. The window can show shares before any process starts.
+    void loadFiles();
+    // Service state, accounts, hostnames, and one tailscale status. No S3 lists, no sessions.
+    void loadStatus();
+    void loadS3();
+    void loadSessions(int protocol);
     void setProfile(const OsProfile &profile) { m_profile = profile; }
     void setRoot(QString root);
     void setCommands(Commands *commands) { m_commands = commands; }
@@ -72,6 +82,9 @@ public:
     QStringList sambaSessions;
     QStringList nfsSessions;
     QStringList iscsiSessions;
+    // Raw `tailscale status --json` from the latest status probe. Peer parsing
+    // reuses this instead of running the command again.
+    QString tailscaleStatus;
 
     // True when smb.conf itself has share sections. Saving then moves them into
     // shares.conf and keeps the previous smb.conf beside it.

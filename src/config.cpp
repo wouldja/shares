@@ -103,19 +103,33 @@ bool commandAllowed(const QStringList &args) {
         return args.size() == 3 && mode.match(args.at(1)).hasMatch() && absolutePathOk(args.at(2));
     }
     // RustFS has no local admin tool. Curl is allowed only against the
-    // loopback admin API, never an arbitrary URL.
+    // loopback admin API, never an arbitrary URL. A one-digit connect and
+    // total timeout is optional so a dead endpoint cannot hang a save.
     if (program == "curl") {
         if (args.size() < 3 || args.at(1) != "-sf")
             return false;
-        QString url;
-        if (args.size() == 3)
-            url = args.at(2);
-        else if (args.size() == 5 && args.at(2) == "-X" && (args.at(3) == "PUT" || args.at(3) == "DELETE" || args.at(3) == "GET"))
-            url = args.at(4);
-        else
+        int index = 2;
+        while (index < args.size() - 1) {
+            if ((args.at(index) == "--connect-timeout" || args.at(index) == "--max-time") && index + 1 < args.size() - 1) {
+                static const QRegularExpression seconds("^[1-9]$");
+                if (!seconds.match(args.at(index + 1)).hasMatch())
+                    return false;
+                index += 2;
+                continue;
+            }
+            if (args.at(index) == "-X" && index + 1 < args.size() - 1) {
+                const auto method = args.at(index + 1);
+                if (method != "PUT" && method != "DELETE" && method != "GET")
+                    return false;
+                index += 2;
+                continue;
+            }
+            return false;
+        }
+        if (index != args.size() - 1)
             return false;
         static const QRegularExpression rustfs("^http://127\\.0\\.0\\.1:[0-9]{2,5}/rustfs/admin/v3/[A-Za-z0-9_./-]*$");
-        return rustfs.match(url).hasMatch();
+        return rustfs.match(args.at(index)).hasMatch();
     }
     return false;
 }

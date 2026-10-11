@@ -29,12 +29,15 @@ ApplicationWindow {
     property bool quitOpen: false
     property bool hostsOpen: false
     property bool needsOpen: false
+    property bool leaveOpen: false
     property int hostCursor: 0
     readonly property bool typing: filterField.activeFocus || nameField.activeFocus || pathField.activeFocus
         || editorField.activeFocus || globalField.activeFocus || importField.activeFocus
         || accountField.activeFocus || secretField.activeFocus || serviceField.activeFocus
         || hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus
-    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || needsOpen
+        || remoteFolderField.activeFocus || remoteImageField.activeFocus
+    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || needsOpen || leaveOpen
+    property int browseCursor: 0
     readonly property bool letters: !overlay && !typing
 
     function closeOverlays() {
@@ -48,6 +51,35 @@ ApplicationWindow {
         quitOpen = false
         hostsOpen = false
         needsOpen = false
+        leaveOpen = false
+    }
+
+    function requestDisconnect() {
+        if (!backend.remote) {
+            hostsOpen = false
+            return
+        }
+        hostsOpen = false
+        needsOpen = false
+        helpOpen = false
+        if (backend.canUndo) {
+            leaveOpen = true
+            return
+        }
+        finishDisconnect()
+    }
+
+    function finishDisconnect() {
+        backend.leaveComputer()
+        leaveOpen = false
+        hostsOpen = false
+        needsOpen = false
+        helpOpen = false
+    }
+
+    function saveAndLeave() {
+        if (backend.save())
+            finishDisconnect()
     }
 
     function requestQuit() {
@@ -131,6 +163,23 @@ ApplicationWindow {
         backend.browseForCreate(pathField.text, nameField.text)
     }
 
+    function makeRemoteFolder() {
+        if (backend.browseMake(remoteFolderField.text))
+            remoteFolderField.text = ""
+    }
+
+    function moveBrowse(delta) {
+        var count = backend.browseRows.length
+        if (count < 1)
+            return
+        browseCursor = (browseCursor + delta + count) % count
+        var y = browseCursor * 32
+        if (y < browseFlick.contentY)
+            browseFlick.contentY = y
+        else if (y + 32 > browseFlick.contentY + browseFlick.height)
+            browseFlick.contentY = y + 32 - browseFlick.height
+    }
+
     function usePickedPath(path) {
         pathField.text = path
         if (nameField.text.trim() === "" && backend.protocol !== 1) {
@@ -165,24 +214,34 @@ ApplicationWindow {
     }
 
     function connectTypedHost() {
-        if (backend.addHost(hostUserField.text, hostNameField.text, parseInt(hostPortField.text)))
-            hostsOpen = false
+        backend.addHost(hostUserField.text, hostNameField.text, parseInt(hostPortField.text))
     }
 
     function activateHost() {
-        if (hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus) {
+        var naming = hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus
+        if (naming && hostNameField.text.trim() !== "") {
             connectTypedHost()
             return
         }
         if (hostCursor < 0 || hostCursor >= backend.hosts.length)
             return
-        if (backend.useHost(backend.hosts[hostCursor].id))
-            hostsOpen = false
+        if (backend.hosts[hostCursor].id === "local") {
+            requestDisconnect()
+            return
+        }
+        backend.useHost(backend.hosts[hostCursor].id, hostUserField.text)
     }
 
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !typing; onActivated: helpOpen = !helpOpen }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: requestQuit() }
+    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote; onActivated: backend.browseCancel() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: overlay && !backend.browsing; onActivated: closeOverlays() }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote && !typing; onActivated: moveBrowse(1) }
+    Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote && !typing; onActivated: moveBrowse(-1) }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote && !typing; onActivated: moveBrowse(1) }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote && !typing; onActivated: moveBrowse(-1) }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote && !typing; onActivated: backend.browseEnter(browseCursor) }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: backend.browsing && backend.remote && !typing; onActivated: backend.browseEnter(browseCursor) }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.setProtocol(0) }
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.setProtocol(1) }
     Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.setProtocol(2) }
@@ -199,6 +258,15 @@ ApplicationWindow {
     Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.copyAddress() }
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openCreate() }
     Shortcut { sequence: "H"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openHosts() }
+    Shortcut {
+        sequence: "X"
+        context: Qt.ApplicationShortcut
+        enabled: backend.remote && !typing && !createOpen && !removeOpen && !passwordsOpen && !editorOpen && !globalOpen && !importOpen && !quitOpen && !leaveOpen
+        onActivated: requestDisconnect()
+    }
+    Shortcut { sequence: "X"; context: Qt.ApplicationShortcut; enabled: leaveOpen; onActivated: finishDisconnect() }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: leaveOpen; onActivated: saveAndLeave() }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: leaveOpen; onActivated: saveAndLeave() }
     Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(1) }
     Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
     Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(1) }
@@ -254,7 +322,12 @@ ApplicationWindow {
             id: row
             anchors.centerIn: parent
             spacing: 8
-            Text { text: label; color: parent.parent.border.color; font.family: win.font.family; font.pixelSize: 12 }
+            Text {
+                text: label
+                color: parent.parent.danger ? "#a17675" : parent.parent.primary ? theme.accent : "#bcbec8"
+                font.family: win.font.family
+                font.pixelSize: 12
+            }
             Keycap { label: key; visible: key !== "" }
         }
         MouseArea { anchors.fill: parent; onClicked: parent.activated() }
@@ -277,9 +350,14 @@ ApplicationWindow {
                 Text { text: "shares"; color: "#bcbec8"; font.bold: true; font.family: win.font.family }
                 Text { text: backend.hostTitle; color: "#7e8089"; font.family: win.font.family }
                 Item {
-                    width: hostCap.width
-                    height: hostCap.height
-                    Keycap { id: hostCap; label: "H" }
+                    width: hostRow.implicitWidth
+                    height: hostRow.implicitHeight
+                    Row {
+                        id: hostRow
+                        spacing: 6
+                        Keycap { label: "H" }
+                        Text { anchors.verticalCenter: parent.verticalCenter; text: "computers"; color: "#7e8089"; font.family: win.font.family }
+                    }
                     MouseArea { anchors.fill: parent; onClicked: win.openHosts() }
                 }
             }
@@ -288,6 +366,18 @@ ApplicationWindow {
                 anchors.rightMargin: 14
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 14
+                Item {
+                    width: backend.remote ? discRow.implicitWidth : 0
+                    height: discRow.implicitHeight
+                    visible: backend.remote
+                    Row {
+                        id: discRow
+                        spacing: 6
+                        Keycap { label: "X" }
+                        Text { anchors.verticalCenter: parent.verticalCenter; text: "disconnect"; color: "#7e8089"; font.family: win.font.family }
+                    }
+                    MouseArea { anchors.fill: parent; onClicked: win.requestDisconnect() }
+                }
                 Row {
                     spacing: 6
                     Keycap { label: "?" }
@@ -380,22 +470,52 @@ ApplicationWindow {
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.minimumWidth: 0
                 Layout.margins: 18
                 Layout.bottomMargin: 8
                 spacing: 8
 
                 RowLayout {
                     Layout.fillWidth: true
-                    ColumnLayout {
-                        spacing: 4
-                        Text { text: backend.protocolName; color: "#bcbec8"; font.pixelSize: 14; font.bold: true; font.family: win.font.family }
-                        Text { text: backend.subtitle; color: "#7e8089"; font.family: win.font.family; width: 460; wrapMode: Text.Wrap }
-                        Text { visible: backend.notice !== ""; text: backend.notice; color: "#907f63"; font.family: win.font.family; width: 460; wrapMode: Text.Wrap }
-                        Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; font.family: win.font.family; width: 460; wrapMode: Text.Wrap }
+                    spacing: 10
+                    // A layout ignores Text.width and sizes from the unwrapped
+                    // line, which pushed Save, New, and the detail column off
+                    // the window. This item takes the leftover width and the
+                    // lines wrap inside it.
+                    Item {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        implicitHeight: heading.implicitHeight
+                        Column {
+                            id: heading
+                            width: parent.width
+                            spacing: 4
+                            Text { width: parent.width; text: backend.protocolName; color: "#bcbec8"; font.pixelSize: 14; font.bold: true; font.family: win.font.family; elide: Text.ElideRight }
+                            Text { width: parent.width; text: backend.subtitle; color: "#7e8089"; font.family: win.font.family; wrapMode: Text.Wrap }
+                            Text {
+                                visible: backend.notice !== ""
+                                width: parent.width
+                                text: backend.notice
+                                color: "#907f63"
+                                font.family: win.font.family
+                                wrapMode: Text.Wrap
+                                maximumLineCount: 6
+                                elide: Text.ElideRight
+                            }
+                            Text {
+                                visible: backend.error !== ""
+                                width: parent.width
+                                text: backend.error
+                                color: "#a17675"
+                                font.family: win.font.family
+                                wrapMode: Text.Wrap
+                                maximumLineCount: 6
+                                elide: Text.ElideRight
+                            }
+                        }
                     }
-                    Item { Layout.fillWidth: true }
-                    ActionButton { label: "Save"; key: "S"; primary: backend.dirty; onActivated: backend.save() }
-                    ActionButton { label: "New"; key: "N"; primary: true; onActivated: win.openCreate() }
+                    ActionButton { label: "Save"; key: "S"; primary: backend.dirty; onActivated: backend.save(); Layout.alignment: Qt.AlignTop }
+                    ActionButton { label: "New"; key: "N"; primary: true; onActivated: win.openCreate(); Layout.alignment: Qt.AlignTop }
                 }
 
                 Rectangle {
@@ -657,7 +777,8 @@ ApplicationWindow {
                     "J K    move through the list",
                     "/    filter",
                     "H    computers on SSH or Tailscale",
-                    "N    new share, export, target, or bucket",
+                    "X    disconnect. X again leaves unsaved edits",
+                    "N    new share. Browse lists that computer",
                     "Ctrl+O    browse again while creating",
                     "E    edit the selected row",
                     "G    Samba global settings",
@@ -717,7 +838,7 @@ ApplicationWindow {
                 }
             }
             Text {
-                visible: backend.browsing
+                visible: backend.browsing && !backend.remote
                 width: 384
                 wrapMode: Text.Wrap
                 text: "The browser is open. Create Folder makes the directory. Arrows, Enter, and the mouse all work there."
@@ -737,6 +858,116 @@ ApplicationWindow {
         target: backend
         function onCreatePathChosen(path) { win.usePickedPath(path) }
         function onNeedsReady() { needsOpen = true }
+        function onComputerReady() { hostsOpen = false }
+        function onBrowseChanged() { win.browseCursor = 0; if (browseFlick) browseFlick.contentY = 0 }
+    }
+
+    Rectangle {
+        visible: backend.browsing && backend.remote
+        onVisibleChanged: if (visible) remoteImageField.text = backend.browseFile
+        anchors.centerIn: parent
+        width: 460
+        height: Math.min(560, remoteBrowseCol.implicitHeight + 36)
+        color: "#16161e"
+        border.color: "#424247"
+        Column {
+            id: remoteBrowseCol
+            x: 18
+            y: 18
+            width: 424
+            spacing: 8
+            Text { text: "Folder on " + backend.hostTitle; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+            Text { width: 424; text: backend.browsePath; color: "#a1a3ad"; font.family: win.font.family; elide: Text.ElideMiddle }
+            Text { width: 424; wrapMode: Text.Wrap; text: "J and K move. Enter opens a directory. Use this folder keeps the one shown above."; color: "#7e8089"; font.family: win.font.family }
+            Flickable {
+                id: browseFlick
+                width: 424
+                height: 220
+                contentHeight: browseList.implicitHeight
+                clip: true
+                Column {
+                    id: browseList
+                    width: 424
+                    spacing: 0
+                    Repeater {
+                        model: backend.browseRows
+                        delegate: Rectangle {
+                            required property var modelData
+                            required property int index
+                            width: 424
+                            height: 32
+                            color: index === win.browseCursor ? "#22222c" : "#0f0f18"
+                            border.color: index === win.browseCursor ? "#6b6d76" : "#424247"
+                            Text {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 8
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData.dir ? modelData.name + "/" : modelData.name
+                                color: "#a1a3ad"
+                                font.family: win.font.family
+                                elide: Text.ElideMiddle
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    win.browseCursor = index
+                                    backend.browseEnter(index)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Row {
+                spacing: 8
+                TextField {
+                    id: remoteFolderField
+                    width: 300
+                    placeholderText: "New folder"
+                    placeholderTextColor: "#7e8089"
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                    background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                    Keys.onReturnPressed: win.makeRemoteFolder()
+                    Keys.onEnterPressed: win.makeRemoteFolder()
+                }
+                ActionButton { label: "Create folder"; onActivated: win.makeRemoteFolder() }
+            }
+            TextField {
+                id: remoteImageField
+                visible: backend.protocol === 2
+                width: 424
+                placeholderText: "Disk image name"
+                placeholderTextColor: "#7e8089"
+                color: "#a1a3ad"
+                font.family: win.font.family
+                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                Keys.onReturnPressed: backend.browseChoose(text)
+                Keys.onEnterPressed: backend.browseChoose(text)
+            }
+            Text {
+                visible: backend.error !== ""
+                text: backend.error
+                color: "#a17675"
+                width: 424
+                wrapMode: Text.Wrap
+                maximumLineCount: 4
+                elide: Text.ElideRight
+                font.family: win.font.family
+            }
+            Row {
+                spacing: 8
+                ActionButton {
+                    label: backend.protocol === 2 ? "Use this file" : "Use this folder"
+                    primary: true
+                    onActivated: backend.browseChoose(remoteImageField.text)
+                }
+                ActionButton { label: "Up"; onActivated: backend.browseUp() }
+                ActionButton { label: "Cancel"; onActivated: backend.browseCancel() }
+            }
+        }
     }
 
     Rectangle {
@@ -753,7 +984,7 @@ ApplicationWindow {
             width: 424
             spacing: 8
             Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-            Text { width: 424; wrapMode: Text.Wrap; text: "Tailscale lists the machines on this tailnet. J and K move. Enter opens the highlighted computer. A typed host uses SSH and the key you already have."; color: "#7e8089"; font.family: win.font.family }
+            Text { width: 424; wrapMode: Text.Wrap; text: "Tailscale lists the machines on this tailnet. J and K move. Enter opens the highlighted computer as the SSH user below, or as this login. A typed host uses SSH and the key you already have."; color: "#7e8089"; font.family: win.font.family }
             Flickable {
                 width: 424
                 height: 220
@@ -787,8 +1018,11 @@ ApplicationWindow {
                                 anchors.fill: parent
                                 onClicked: {
                                     win.hostCursor = index
-                                    if (backend.useHost(modelData.id))
-                                        win.hostsOpen = false
+                                    if (modelData.id === "local") {
+                                        win.requestDisconnect()
+                                        return
+                                    }
+                                    backend.useHost(modelData.id, hostUserField.text)
                                 }
                             }
                         }
@@ -823,6 +1057,14 @@ ApplicationWindow {
                 text: "22"
                 background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
             }
+            Text {
+                visible: backend.connecting
+                width: 424
+                wrapMode: Text.Wrap
+                text: backend.notice
+                color: "#a1a3ad"
+                font.family: win.font.family
+            }
             Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 424; wrapMode: Text.Wrap; font.family: win.font.family }
             Row {
                 spacing: 8
@@ -831,7 +1073,8 @@ ApplicationWindow {
                     primary: true
                     onActivated: win.connectTypedHost()
                 }
-                ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: { if (backend.trustHost()) win.hostsOpen = false } }
+                ActionButton { label: "Disconnect"; visible: backend.remote; onActivated: win.requestDisconnect() }
+                ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: backend.trustHost() }
                 ActionButton { label: "Close"; onActivated: win.hostsOpen = false }
             }
         }
@@ -852,10 +1095,21 @@ ApplicationWindow {
             spacing: 10
             Text { text: "Needed on " + backend.hostTitle; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
             Text { width: 444; wrapMode: Text.Wrap; text: backend.needsText; color: "#a1a3ad"; font.family: win.font.family }
+            Text {
+                visible: backend.error !== ""
+                width: 444
+                wrapMode: Text.Wrap
+                maximumLineCount: 8
+                elide: Text.ElideRight
+                text: backend.error
+                color: "#a17675"
+                font.family: win.font.family
+            }
             Row {
                 spacing: 8
                 ActionButton { label: "Install"; primary: true; visible: backend.canInstall; onActivated: { if (backend.installNeeds()) win.needsOpen = false } }
                 ActionButton { label: "Not now"; onActivated: win.needsOpen = false }
+                ActionButton { label: "Disconnect"; visible: backend.remote; onActivated: win.requestDisconnect() }
             }
         }
     }
@@ -1086,6 +1340,31 @@ ApplicationWindow {
                 ActionButton { label: "Save and quit"; key: ""; primary: true; onActivated: win.saveAndQuit() }
                 ActionButton { label: "Quit"; key: ""; danger: true; onActivated: Qt.quit() }
                 ActionButton { label: "Keep editing"; key: ""; onActivated: win.quitOpen = false }
+            }
+        }
+    }
+
+    Rectangle {
+        visible: win.leaveOpen
+        anchors.centerIn: parent
+        width: 420
+        height: leaveCol.implicitHeight + 36
+        color: "#16161e"
+        border.color: "#424247"
+        Column {
+            id: leaveCol
+            x: 18
+            y: 18
+            width: 384
+            spacing: 12
+            Text { text: "Leave " + backend.hostTitle + "?"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+            Text { width: 384; wrapMode: Text.Wrap; text: "Changes in this window are not written."; color: "#a1a3ad"; font.family: win.font.family }
+            Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 384; wrapMode: Text.Wrap; font.family: win.font.family }
+            Row {
+                spacing: 8
+                ActionButton { label: "Save and leave"; key: "Enter"; primary: true; onActivated: win.saveAndLeave() }
+                ActionButton { label: "Leave"; key: "X"; danger: true; onActivated: win.finishDisconnect() }
+                ActionButton { label: "Keep editing"; key: "Esc"; onActivated: win.leaveOpen = false }
             }
         }
     }

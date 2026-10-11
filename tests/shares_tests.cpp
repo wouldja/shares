@@ -29,7 +29,7 @@ public:
     QVector<QStringList> calls;
     QStringList inputs;
 
-    CommandResult run(const QString &program, const QStringList &args, const QString &input = {}) override {
+    CommandResult run(const QString &program, const QStringList &args, const QString &input = {}, int = 8000) override {
         calls.append(QStringList{program} + args);
         inputs.append(input);
         const auto key = (QStringList{program} + args).join(' ');
@@ -37,6 +37,8 @@ public:
             return exact.value(key);
         return {0, {}, {}, false};
     }
+
+    bool parallelProbes() const override { return false; }
 };
 
 bool writeFile(const QString &path, const QString &body) {
@@ -66,6 +68,7 @@ QString readFile(const QString &path) {
 class ScriptedLink : public RemoteLink {
 public:
     QHash<QString, CommandResult> exact;
+    QVector<QPair<QString, CommandResult>> queued;
     QVector<QStringList> calls;
     QStringList inputs;
     bool installed = false;
@@ -74,6 +77,13 @@ public:
         calls.append(argv);
         inputs.append(input);
         const auto key = argv.join(' ');
+        for (int i = 0; i < queued.size(); ++i) {
+            if (queued.at(i).first == key) {
+                const auto result = queued.at(i).second;
+                queued.removeAt(i);
+                return result;
+            }
+        }
         if (key.contains("apt-get install") || key.contains("pacman -S"))
             installed = true;
         if (exact.contains(key))
@@ -189,6 +199,10 @@ private slots:
     void commandWhitelistRejectsAShell() {
         QVERIFY(commandAllowed({"exportfs", "-ra"}));
         QVERIFY(commandAllowed({"curl", "-sf", "http://127.0.0.1:9000/rustfs/admin/v3/buckets"}));
+        QVERIFY(commandAllowed({"curl", "-sf", "--connect-timeout", "2", "--max-time", "3",
+                                "http://127.0.0.1:9000/rustfs/admin/v3/buckets"}));
+        QVERIFY(!commandAllowed({"curl", "-sf", "--connect-timeout", "20", "--max-time", "3",
+                                 "http://127.0.0.1:9000/rustfs/admin/v3/buckets"}));
         QVERIFY(!commandAllowed({"bash", "-c", "id"}));
         QVERIFY(!commandAllowed({"curl", "-sf", "http://example.com/rustfs/admin/v3/buckets"}));
         QVERIFY(!commandAllowed({"mkdir", "-p", "/srv/../etc"}));
@@ -375,6 +389,7 @@ private slots:
         QTemporaryDir dir;
         FakeCommands commands;
         commands.exact.insert("mc --version", {0, "mc version\n", {}, false});
+        commands.exact.insert("mc ls local", {0, "photos/\n", {}, false});
         Backend backend(dir.path(), &commands);
         backend.setProtocol(3);
         QVERIFY(backend.create("photos", "minio"));
@@ -430,6 +445,59 @@ private slots:
         QCOMPARE(picker.files, 1);
         QCOMPARE(picker.folders, 0);
         QVERIFY(backend.error().contains("no folder"));
+    }
+
+    void remoteBrowseReadsTheServerNotThisComputer() {
+        QTemporaryDir dir;
+        QVERIFY(QDir().mkpath(dir.path() + "/only-local"));
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json", {0, "{}", {}, false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        link.exact.insert("test -d '/'", {0, {}, {}, false});
+        link.exact.insert("ls -1 -A -p --color=never --quoting-style=literal -- '/'", {0, "srv/\nphotos\n", {}, false});
+        link.exact.insert("test -d '/srv'", {0, {}, {}, false});
+        link.exact.insert("ls -1 -A -p --color=never --quoting-style=literal -- '/srv'",
+                          {0, "photos/\ndisk.img\n", {}, false});
+        link.exact.insert("mkdir -- '/srv/new folder'", {0, {}, {}, false});
+        FakePicker picker;
+        Backend backend(dir.path(), &commands, &picker, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        QVERIFY(backend.addHost("root", "files.example.net", 22));
+        QVERIFY(backend.remote());
+        QSignalSpy chosen(&backend, &Backend::createPathChosen);
+        backend.browseForCreate(dir.path() + "/only-local", "");
+        QVERIFY(backend.browsing());
+        QCOMPARE(picker.folders, 0);
+        QCOMPARE(picker.files, 0);
+        QCOMPARE(backend.browsePath(), QString("/"));
+        QCOMPARE(backend.browseRows().size(), 2);
+        QVERIFY(backend.browseRows().first().toMap().value("dir").toBool());
+        QCOMPARE(backend.browseRows().first().toMap().value("name").toString(), QString("srv"));
+        backend.browseEnter(1);
+        QVERIFY(backend.error().contains("file"));
+        QCOMPARE(backend.browsePath(), QString("/"));
+        backend.browseEnter(0);
+        QCOMPARE(backend.browsePath(), QString("/srv"));
+        QVERIFY(!backend.browseMake("o'brien"));
+        QVERIFY(joinedCalls(link.calls).contains("mkdir -- '/srv/o'\\''brien'"));
+        QVERIFY(backend.browseMake("new folder"));
+        QVERIFY(joinedCalls(link.calls).contains("mkdir -- '/srv/new folder'"));
+        backend.browseChoose("");
+        QCOMPARE(chosen.size(), 1);
+        QCOMPARE(chosen.first().first().toString(), QString("/srv"));
+        QVERIFY(!backend.browsing());
+
+        backend.setProtocol(2);
+        backend.browseForCreate("/srv/clips.img", "clips");
+        QVERIFY(backend.browsing());
+        QCOMPARE(picker.files, 0);
+        QCOMPARE(backend.browsePath(), QString("/srv"));
+        QCOMPARE(backend.browseFile(), QString("clips.img"));
+        backend.browseEnter(1);
+        QCOMPARE(chosen.last().first().toString(), QString("/srv/disk.img"));
+        QVERIFY(!backend.browsing());
     }
 
     void tailscalePeersSkipSelfAndOffline() {
@@ -572,6 +640,12 @@ private slots:
         QVERIFY(pve != rows.cend());
         QVERIFY(pve->toMap().value("detail").toString().contains("Tailscale SSH"));
         QVERIFY(pve->toMap().value("detail").toString().contains("pve.example.ts.net"));
+        int statusCalls = 0;
+        for (const auto &call : commands.calls) {
+            if (call.join(' ') == "tailscale status --json")
+                ++statusCalls;
+        }
+        QCOMPARE(statusCalls, 1);
 
         QVERIFY(backend.addHost("share", "files.example.net", 22));
         QCOMPARE(backend.hostTitle(), QString("files"));
@@ -635,6 +709,163 @@ private slots:
         QVERIFY(other.error().contains("host key"));
         QVERIFY(!other.trustHost());
         QVERIFY(!joinedCalls(denied.calls).contains("StrictHostKeyChecking"));
+    }
+
+    void remoteInstallProceedsWhenSmbConfAlreadyHasShares() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json", {0, "{}", {}, false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        const auto smb = QByteArray("[global]\n   workgroup = WORKGROUP\n[homes]\n   path = /home\n");
+        link.exact.insert(remoteBundleArgv().join(' '),
+                          {0, QString::fromUtf8(remoteBundlePayload({{QStringLiteral("/etc/samba/smb.conf"), smb}})), {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        QVERIFY(backend.addHost("root", "bandc.example.net", 22));
+        QVERIFY(backend.dirty());
+        QVERIFY(backend.notice().contains("smb.conf"));
+        QVERIFY(backend.canInstall());
+        QVERIFY(backend.installNeeds());
+        QVERIFY(joinedCalls(link.calls).contains("apt-get install"));
+        QVERIFY(backend.dirty());
+        QVERIFY(backend.create("photos", "/srv/photos"));
+        QVERIFY(!backend.installNeeds());
+        QVERIFY(backend.error().contains("Save or discard"));
+        QCOMPARE(joinedCalls(link.calls).count("apt-get install"), 1);
+    }
+
+    void disconnectReturnsHomeWhenTheServerOnlyLooksUnsaved() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json", {0, "{}", {}, false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        const auto smb = QByteArray("[global]\n   workgroup = WORKGROUP\n[homes]\n   path = /home\n");
+        link.exact.insert(remoteBundleArgv().join(' '),
+                          {0, QString::fromUtf8(remoteBundlePayload({{QStringLiteral("/etc/samba/smb.conf"), smb}})), {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        QVERIFY(backend.addHost("root", "files.example.net", 22));
+        QVERIFY(backend.remote());
+        QVERIFY(backend.dirty());
+        QVERIFY(!backend.canUndo());
+        QVERIFY(backend.useHost("local"));
+        QCOMPARE(backend.hostTitle(), QString("This computer"));
+        QVERIFY(!backend.remote());
+
+        QVERIFY(backend.addHost("root", "files.example.net", 22));
+        QVERIFY(backend.create("photos", "/srv/photos"));
+        QVERIFY(backend.canUndo());
+        QVERIFY(!backend.useHost("local"));
+        QVERIFY(backend.error().contains("Save or discard"));
+        QCOMPARE(backend.hostTitle(), QString("files"));
+        QVERIFY(backend.leaveComputer());
+        QCOMPARE(backend.hostTitle(), QString("This computer"));
+        QVERIFY(!backend.remote());
+        QCOMPARE(backend.rows().size(), 0);
+    }
+
+    void tailscaleSshUsesRootWhenTheLoginIsRejected() {
+        const auto previousUser = qgetenv("USER");
+        qputenv("USER", "brian");
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json",
+                              {0,
+                               QString(R"({"Self":{"DNSName":"omacrown.example.ts.net."},"Peer":{"bandc":{"HostName":"bandc","DNSName":"bandc.example.ts.net.","Online":true,"TailscaleIPs":["100.100.100.2"],"sshHostKeys":["ssh-ed25519 AAAA"]}}})"),
+                               {},
+                               false});
+        ScriptedLink link;
+        link.queued.append({QStringLiteral("cat /etc/os-release"),
+                            {1, {}, "tailscale: tailnet policy does not permit you to SSH as user \"brian\"\n", false}});
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        backend.refreshHosts();
+        QString id;
+        for (const auto &row : backend.hosts()) {
+            const auto map = row.toMap();
+            if (map.value("name").toString() == "bandc") {
+                id = map.value("id").toString();
+                QVERIFY(map.value("detail").toString().contains("brian"));
+                QVERIFY(map.value("detail").toString().contains("Tailscale SSH"));
+            }
+        }
+        QVERIFY(id.startsWith("ts:"));
+        QVERIFY(!backend.useHost(id, "Brian"));
+        QVERIFY(backend.error().contains("lowercase"));
+        QCOMPARE(link.calls.size(), 0);
+
+        QVERIFY(!backend.useHost(id, "share"));
+        QCOMPARE(link.calls.size(), 1);
+        QVERIFY(backend.error().contains("does not permit"));
+        QVERIFY(!backend.error().contains("Root was refused"));
+
+        link.queued.append({QStringLiteral("cat /etc/os-release"),
+                            {1, {}, "tailscale: tailnet policy does not permit you to SSH as user \"brian\"\n", false}});
+        QVERIFY(backend.useHost(id));
+        QVERIFY(backend.remote());
+        QCOMPARE(backend.hostTitle(), QString("bandc"));
+        int releases = 0;
+        for (const auto &call : link.calls) {
+            if (call.join(' ') == "cat /etc/os-release")
+                ++releases;
+        }
+        QCOMPARE(releases, 3);
+        qputenv("USER", previousUser);
+    }
+
+    void s3ListsWaitUntilThePageOpens() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("mc --version", {0, "mc version\n", {}, false});
+        Backend backend(dir.path(), &commands);
+        QVERIFY(!joinedCalls(commands.calls).contains("mc ls"));
+        QVERIFY(!joinedCalls(commands.calls).contains("mc admin user list"));
+        backend.setProtocol(3);
+        QVERIFY(joinedCalls(commands.calls).contains("mc ls local"));
+        QVERIFY(joinedCalls(commands.calls).contains("mc admin user list local"));
+        backend.setProtocol(0);
+        const auto lists = joinedCalls(commands.calls).count("mc ls local");
+        backend.setProtocol(3);
+        QCOMPARE(joinedCalls(commands.calls).count("mc ls local"), lists);
+    }
+
+    void sessionProbesFollowTheOpenPage() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        Backend backend(dir.path(), &commands);
+        QVERIFY(joinedCalls(commands.calls).contains("smbstatus -b"));
+        QVERIFY(!joinedCalls(commands.calls).contains("targetcli sessions"));
+        const auto ss = QStringLiteral("ss -H -t state established sport = :2049");
+        QVERIFY(!joinedCalls(commands.calls).contains(ss));
+        backend.setProtocol(1);
+        QVERIFY(joinedCalls(commands.calls).contains(ss));
+        backend.setProtocol(2);
+        QVERIFY(joinedCalls(commands.calls).contains("targetcli sessions"));
+        const auto before = joinedCalls(commands.calls).count("smbstatus -b");
+        backend.setProtocol(0);
+        QCOMPARE(joinedCalls(commands.calls).count("smbstatus -b"), before);
+    }
+
+    void remoteBundleWritesShareFilesOnly() {
+        QTemporaryDir dir;
+        const QByteArray payload = remoteBundlePayload(
+            {{QStringLiteral("/etc/samba/smb.conf"), QByteArray("[homes]\n   path = /home\n")},
+             {QStringLiteral("/etc/exports.d/shares.exports"), QByteArray("/srv/photos *(rw)\n")},
+             {QStringLiteral("/etc/passwd"), QByteArray("nope\n")}});
+        QString error;
+        QVERIFY(writeRemoteBundle(payload, dir.path(), &error));
+        QVERIFY(error.isEmpty());
+        QVERIFY(readFile(dir.path() + "/etc/samba/smb.conf").contains("[homes]"));
+        QVERIFY(readFile(dir.path() + "/etc/exports.d/shares.exports").contains("/srv/photos"));
+        QVERIFY(!QFile::exists(dir.path() + "/etc/passwd"));
+        QVERIFY(remoteBundleArgv().join(' ').contains("emit /etc/samba/shares.conf"));
+        QCOMPARE(remoteBundleArgv().size(), 5);
     }
 
     void themeFallsBack() {

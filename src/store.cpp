@@ -1,5 +1,6 @@
 #include "store.h"
 
+#include <QHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -11,6 +12,9 @@
 #include <QSaveFile>
 #include <QSet>
 #include <QStandardPaths>
+#include <QThread>
+
+#include <vector>
 
 namespace {
 
@@ -24,14 +28,60 @@ QString readFile(const QString &path) {
     return QString::fromUtf8(file.readAll());
 }
 
-QString serviceState(Commands *commands, const QString &unit, const QString &package) {
-    const auto result = commands->run("systemctl", {"is-active", unit});
+QString serviceState(const CommandResult &result, const QString &unit, const QString &package) {
     if (result.missing)
         return package + " is not installed";
     const auto state = result.out.trimmed();
     if (state.isEmpty())
         return unit + " is " + (result.err.trimmed().isEmpty() ? QString("unknown") : result.err.trimmed());
     return unit + " is " + state;
+}
+
+struct ProbeCall {
+    QString id;
+    QString program;
+    QStringList args;
+    int timeoutMs = 2500;
+};
+
+QHash<QString, CommandResult> runProbes(Commands *commands, const QVector<ProbeCall> &probes) {
+    QHash<QString, CommandResult> out;
+    if (!commands || probes.isEmpty())
+        return out;
+    if (!commands->parallelProbes() || probes.size() == 1) {
+        for (const auto &probe : probes)
+            out.insert(probe.id, commands->run(probe.program, probe.args, {}, probe.timeoutMs));
+        return out;
+    }
+    // QProcess needs a QThread. Each probe gets one, and this call waits until
+    // they finish. A separate thread per probe keeps a slow curl from holding
+    // up systemctl.
+    std::vector<CommandResult> results(probes.size());
+    QVector<QThread *> threads;
+    threads.reserve(probes.size());
+    for (int i = 0; i < probes.size(); ++i) {
+        const auto probe = probes.at(i);
+        auto *thread = QThread::create([commands, probe, i, &results] {
+            results[i] = commands->run(probe.program, probe.args, {}, probe.timeoutMs);
+        });
+        thread->start();
+        threads.append(thread);
+    }
+    for (auto *thread : threads) {
+        thread->wait();
+        delete thread;
+    }
+    for (int i = 0; i < probes.size(); ++i)
+        out.insert(probes.at(i).id, results.at(i));
+    return out;
+}
+
+QStringList rustfsCurl(const QString &method, const QString &url) {
+    QStringList args{"curl", "-sf", "--connect-timeout", "2", "--max-time", "3"};
+    if (!method.isEmpty())
+        args << "-X" << method;
+    args << url;
+    return args;
 }
 
 QStringList tailnetName(const QString &json) {
@@ -54,17 +104,17 @@ bool loopbackOrigin(const QString &url) {
 
 Commands::~Commands() = default;
 
-CommandResult Commands::run(const QString &program, const QStringList &args, const QString &input) {
+CommandResult Commands::run(const QString &program, const QStringList &args, const QString &input, int timeoutMs) {
     if (QStandardPaths::findExecutable(program).isEmpty())
         return {127, {}, "not found", true};
     QProcess process;
     process.start(program, args);
-    if (!process.waitForStarted(3000))
+    if (!process.waitForStarted(qMin(3000, timeoutMs)))
         return {127, {}, process.errorString(), true};
     if (!input.isEmpty())
         process.write(input.toUtf8());
     process.closeWriteChannel();
-    if (!process.waitForFinished(8000)) {
+    if (!process.waitForFinished(timeoutMs)) {
         process.kill();
         process.waitForFinished(1000);
         return {124, {}, "timed out", false};
@@ -83,7 +133,7 @@ void Library::setRoot(QString root) {
     m_root = root;
 }
 
-void Library::load() {
+void Library::loadFiles() {
     notice.clear();
     const auto sharesConf = readFile(m_root + "/etc/samba/shares.conf");
     const auto smbConf = readFile(m_root + "/etc/samba/smb.conf");
@@ -116,77 +166,45 @@ void Library::load() {
     bool iscsiOk = false;
     iscsi = parseIscsiJson(readFile(m_root + "/etc/shares/iscsi.json").toUtf8(), &iscsiOk);
 
-    sambaState = serviceState(m_commands, m_profile.sambaUnit, m_profile.sambaPackage);
-    nfsState = serviceState(m_commands, m_profile.nfsUnit, m_profile.nfsPackage);
-    iscsiState = serviceState(m_commands, m_profile.iscsiUnit, m_profile.iscsiPackage);
-    if (m_commands->run("gwcli", {"--version"}).missing && m_commands->run("rbd", {"--version"}).missing)
-        iscsiState += iscsi.clustered ? " · clustered tools are not installed" : "";
-    else if (iscsi.clustered)
-        iscsiState += " · clustered tools are installed";
-
     const auto s3Json = QJsonDocument::fromJson(readFile(m_root + "/etc/shares/s3.json").toUtf8()).object();
     const auto origin = s3Json.value("rustfs").toString();
     if (loopbackOrigin(origin))
         rustfsEndpoint = origin;
+}
 
-    s3Backends.clear();
-    const auto toolReady = [this](const QString &program) {
-        const auto version = m_commands->run(program, {"--version"});
-        return !version.missing && version.code == 0 && !version.out.trimmed().isEmpty();
+void Library::loadStatus() {
+    if (!m_commands)
+        return;
+    const int timeout = m_commands->probeTimeoutMs();
+    QVector<ProbeCall> probes = {
+        {"samba", "systemctl", {"is-active", m_profile.sambaUnit}, timeout},
+        {"nfs", "systemctl", {"is-active", m_profile.nfsUnit}, timeout},
+        {"iscsi", "systemctl", {"is-active", m_profile.iscsiUnit}, timeout},
+        {"gwcli", "gwcli", {"--version"}, timeout},
+        {"rbd", "rbd", {"--version"}, timeout},
+        {"hostname-s", "hostname", {"-s"}, timeout},
+        {"hostname-f", "hostname", {"-f"}, timeout},
+        {"tailscale", "tailscale", {"status", "--json"}, qMax(timeout, 3000)},
+        {"passwd", "getent", {"passwd"}, timeout},
+        {"pdbedit", "pdbedit", {"-L"}, timeout},
     };
-    const auto unitActive = [this](const QString &unit) {
-        return m_commands->run("systemctl", {"is-active", unit}).out.trimmed() == "active";
-    };
-    // Curl existing is not RustFS existing. RustFS counts when its service is
-    // up or its loopback admin API answers.
-    if (unitActive("minio") || toolReady("mc"))
-        s3Backends << "minio";
-    if (unitActive("garage") || toolReady("garage"))
-        s3Backends << "garage";
-    if (unitActive("ceph-radosgw") || toolReady("radosgw-admin"))
-        s3Backends << "ceph";
-    const auto rustfsProbe = m_commands->run("curl", {"-sf", rustfsEndpoint + "/rustfs/admin/v3/buckets"});
-    if (unitActive("rustfs") || (!rustfsProbe.missing && rustfsProbe.code == 0 && !rustfsProbe.out.trimmed().isEmpty()))
-        s3Backends << "rustfs";
-    s3State = s3Backends.isEmpty() ? "no S3 backend is installed" : s3Backends.join(", ");
-    s3 = {};
-    for (const auto &backend : s3Backends) {
-        CommandResult listed;
-        if (backend == "minio")
-            listed = m_commands->run("mc", {"ls", "local"});
-        else if (backend == "garage")
-            listed = m_commands->run("garage", {"bucket", "list"});
-        else if (backend == "ceph")
-            listed = m_commands->run("radosgw-admin", {"bucket", "list"});
-        else
-            listed = m_commands->run("curl", {"-sf", rustfsEndpoint + "/rustfs/admin/v3/buckets"});
-        if (!listed.missing && listed.code == 0)
-            s3.buckets += parseBucketList(backend, listed.out);
-        else if (!listed.missing && !listed.err.trimmed().isEmpty())
-            notice += (notice.isEmpty() ? "" : " ") + backend + ": " + listed.err.trimmed();
-        CommandResult access;
-        if (backend == "minio")
-            access = m_commands->run("mc", {"admin", "user", "list", "local"});
-        else if (backend == "garage")
-            access = m_commands->run("garage", {"key", "list"});
-        else if (backend == "ceph")
-            access = m_commands->run("radosgw-admin", {"user", "list"});
-        if (!access.missing && access.code == 0) {
-            for (const auto &name : parseAccessList(backend, access.out))
-                s3.access.append({backend, name, backend == "garage" ? "key" : "user"});
-        }
-    }
+    const auto result = runProbes(m_commands, probes);
+    sambaState = serviceState(result.value("samba"), m_profile.sambaUnit, m_profile.sambaPackage);
+    nfsState = serviceState(result.value("nfs"), m_profile.nfsUnit, m_profile.nfsPackage);
+    iscsiState = serviceState(result.value("iscsi"), m_profile.iscsiUnit, m_profile.iscsiPackage);
+    if (result.value("gwcli").missing && result.value("rbd").missing)
+        iscsiState += iscsi.clustered ? " · clustered tools are not installed" : "";
+    else if (iscsi.clustered)
+        iscsiState += " · clustered tools are installed";
 
     users.clear();
-    const auto passwd = m_commands->run("getent", {"passwd"});
-    const auto pdbedit = m_commands->run("pdbedit", {"-L"});
     QSet<QString> sambaUsers;
-    for (const auto &line : pdbedit.out.split('\n')) {
+    for (const auto &line : result.value("pdbedit").out.split('\n')) {
         const auto name = line.section(':', 0, 0).trimmed();
         if (accountNameOk(name))
             sambaUsers.insert(name);
     }
-    for (const auto &line : passwd.out.split('\n')) {
+    for (const auto &line : result.value("passwd").out.split('\n')) {
         const auto parts = line.split(':');
         if (parts.size() < 3 || !accountNameOk(parts.at(0)))
             continue;
@@ -197,25 +215,109 @@ void Library::load() {
         users.append({parts.at(0), sambaUsers.contains(parts.at(0))});
     }
 
-    const auto smbstatus = m_commands->run("smbstatus", {"-b"});
-    sambaSessions = parseSessions(smbstatus.out);
-    const auto nfsClients = m_commands->run("ss", {"-H", "-t", "state", "established", "sport", "=", ":2049"});
-    nfsSessions = parseSessions(nfsClients.missing ? "" : nfsClients.out);
-    const auto targetSessions = m_commands->run("targetcli", {"sessions"});
-    iscsiSessions = parseSessions(targetSessions.out);
-
     reachable.clear();
-    const auto shortName = m_commands->run("hostname", {"-s"}).out.trimmed();
-    const auto fullName = m_commands->run("hostname", {"-f"}).out.trimmed();
+    const auto shortName = result.value("hostname-s").out.trimmed();
+    const auto fullName = result.value("hostname-f").out.trimmed();
     if (!shortName.isEmpty())
         reachable << shortName + ".local";
     if (!fullName.isEmpty() && fullName != shortName)
         reachable << fullName;
-    const auto tailscale = m_commands->run("tailscale", {"status", "--json"});
-    if (!tailscale.missing && tailscale.code == 0)
-        reachable += tailnetName(tailscale.out);
+    const auto tailscale = result.value("tailscale");
+    tailscaleStatus = (!tailscale.missing && tailscale.code == 0) ? tailscale.out : QString();
+    if (!tailscaleStatus.isEmpty())
+        reachable += tailnetName(tailscaleStatus);
     if (reachable.isEmpty())
         reachable << "localhost";
+}
+
+void Library::loadS3() {
+    if (!m_commands)
+        return;
+    const int timeout = m_commands->probeTimeoutMs();
+    const int curlTimeout = qMax(timeout, 4000);
+    const auto bucketsUrl = rustfsEndpoint + "/rustfs/admin/v3/buckets";
+    const auto curl = rustfsCurl({}, bucketsUrl);
+    QVector<ProbeCall> probes = {
+        {"minio-unit", "systemctl", {"is-active", "minio"}, timeout},
+        {"garage-unit", "systemctl", {"is-active", "garage"}, timeout},
+        {"ceph-unit", "systemctl", {"is-active", "ceph-radosgw"}, timeout},
+        {"rustfs-unit", "systemctl", {"is-active", "rustfs"}, timeout},
+        {"mc", "mc", {"--version"}, timeout},
+        {"garage", "garage", {"--version"}, timeout},
+        {"radosgw-admin", "radosgw-admin", {"--version"}, timeout},
+        {"rustfs-curl", curl.first(), curl.mid(1), curlTimeout},
+    };
+    const auto result = runProbes(m_commands, probes);
+    const auto toolReady = [&result](const QString &id) {
+        const auto version = result.value(id);
+        return !version.missing && version.code == 0 && !version.out.trimmed().isEmpty();
+    };
+    const auto unitActive = [&result](const QString &id) { return result.value(id).out.trimmed() == "active"; };
+    s3Backends.clear();
+    // Curl existing is not RustFS existing. RustFS counts when its service is
+    // up or its loopback admin API answers.
+    if (unitActive("minio-unit") || toolReady("mc"))
+        s3Backends << "minio";
+    if (unitActive("garage-unit") || toolReady("garage"))
+        s3Backends << "garage";
+    if (unitActive("ceph-unit") || toolReady("radosgw-admin"))
+        s3Backends << "ceph";
+    const auto rustfsProbe = result.value("rustfs-curl");
+    if (unitActive("rustfs-unit") || (!rustfsProbe.missing && rustfsProbe.code == 0 && !rustfsProbe.out.trimmed().isEmpty()))
+        s3Backends << "rustfs";
+    s3State = s3Backends.isEmpty() ? "no S3 backend is installed" : s3Backends.join(", ");
+    s3 = {};
+    QVector<ProbeCall> lists;
+    for (const auto &backend : s3Backends) {
+        if (backend == "minio") {
+            lists.append({"minio-buckets", "mc", {"ls", "local"}, timeout});
+            lists.append({"minio-access", "mc", {"admin", "user", "list", "local"}, timeout});
+        } else if (backend == "garage") {
+            lists.append({"garage-buckets", "garage", {"bucket", "list"}, timeout});
+            lists.append({"garage-access", "garage", {"key", "list"}, timeout});
+        } else if (backend == "ceph") {
+            lists.append({"ceph-buckets", "radosgw-admin", {"bucket", "list"}, timeout});
+            lists.append({"ceph-access", "radosgw-admin", {"user", "list"}, timeout});
+        }
+    }
+    const auto listed = runProbes(m_commands, lists);
+    for (const auto &backend : s3Backends) {
+        CommandResult buckets;
+        if (backend == "rustfs")
+            buckets = rustfsProbe;
+        else
+            buckets = listed.value(backend + "-buckets");
+        if (!buckets.missing && buckets.code == 0)
+            s3.buckets += parseBucketList(backend, buckets.out);
+        else if (!buckets.missing && !buckets.err.trimmed().isEmpty()) {
+            const auto line = backend + ": " + buckets.err.trimmed();
+            if (!notice.contains(line))
+                notice += (notice.isEmpty() ? "" : " ") + line;
+        }
+        if (backend == "rustfs")
+            continue;
+        const auto access = listed.value(backend + "-access");
+        if (!access.missing && access.code == 0) {
+            for (const auto &name : parseAccessList(backend, access.out))
+                s3.access.append({backend, name, backend == "garage" ? "key" : "user"});
+        }
+    }
+}
+
+void Library::loadSessions(int protocol) {
+    if (!m_commands)
+        return;
+    const int timeout = m_commands->probeTimeoutMs();
+    if (protocol == 0) {
+        const auto smbstatus = m_commands->run("smbstatus", {"-b"}, {}, timeout);
+        sambaSessions = parseSessions(smbstatus.out);
+    } else if (protocol == 1) {
+        const auto nfsClients = m_commands->run("ss", {"-H", "-t", "state", "established", "sport", "=", ":2049"}, {}, timeout);
+        nfsSessions = parseSessions(nfsClients.missing ? QString() : nfsClients.out);
+    } else if (protocol == 2) {
+        const auto targetSessions = m_commands->run("targetcli", {"sessions"}, {}, timeout);
+        iscsiSessions = parseSessions(targetSessions.out);
+    }
 }
 
 Plan Library::plan(const SambaConfig &nextSamba, const QVector<NfsExport> &nextNfs, const IscsiConfig &nextIscsi) const {
@@ -490,7 +592,7 @@ QStringList s3BucketArgs(const QString &backend, const QString &action, const QS
     }
     if (backend == "rustfs" && loopbackOrigin(endpoint) && (action == "create" || action == "delete")) {
         const auto method = action == "create" ? QString("PUT") : QString("DELETE");
-        return {"curl", "-sf", "-X", method, endpoint + "/rustfs/admin/v3/buckets/" + name};
+        return rustfsCurl(method, endpoint + "/rustfs/admin/v3/buckets/" + name);
     }
     if (error)
         *error = "That S3 backend is not available.";
