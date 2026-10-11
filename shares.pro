@@ -7,6 +7,8 @@ TEMPLATE = app
 HEADERS += \
     src/backend.h \
     src/config.h \
+    src/filepicker.h \
+    src/portalfilepicker.h \
     src/store.h \
     src/theme.h
 
@@ -14,6 +16,7 @@ SOURCES += \
     src/main.cpp \
     src/backend.cpp \
     src/config.cpp \
+    src/portalfilepicker.cpp \
     src/store.cpp \
     src/theme.cpp
 

@@ -4,8 +4,11 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QJsonDocument>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QtTest>
+
+#include "filepicker.h"
 
 #include "backend.h"
 #include "config.h"
@@ -53,6 +56,31 @@ QString readFile(const QString &path) {
 }
 
 } // namespace
+
+class FakePicker : public FilePicker {
+public:
+    int folders = 0;
+    int files = 0;
+    QString title;
+    QString folder;
+    QString suggested;
+
+    void chooseFolder(const QString &title, const QString &currentFolder) override {
+        ++folders;
+        this->title = title;
+        folder = currentFolder;
+    }
+
+    void chooseNewFile(const QString &title, const QString &currentFolder, const QString &suggestedName) override {
+        ++files;
+        this->title = title;
+        folder = currentFolder;
+        suggested = suggestedName;
+    }
+
+    void send(const QString &path) { emit chosen(path); }
+    void cancel() { emit cancelled(); }
+};
 
 class SharesTests : public QObject {
     Q_OBJECT
@@ -288,6 +316,56 @@ private slots:
         QVERIFY(backend.create("photos", "minio"));
         QCOMPARE(backend.rows().size(), 1);
         QVERIFY(commands.calls.contains(QStringList{"mc", "mb", "local/photos"}));
+    }
+
+    void browseOpensAFolderAndFillsThePath() {
+        QTemporaryDir dir;
+        QVERIFY(QDir().mkpath(dir.path() + "/photos"));
+        FakeCommands commands;
+        FakePicker picker;
+        Backend backend(dir.path(), &commands, &picker);
+        QSignalSpy chosen(&backend, &Backend::createPathChosen);
+        backend.browseForCreate(dir.path() + "/photos", "");
+        QCOMPARE(picker.folders, 1);
+        QCOMPARE(picker.files, 0);
+        QCOMPARE(picker.title, QString("Folder to share"));
+        QCOMPARE(picker.folder, dir.path() + "/photos");
+        QVERIFY(backend.browsing());
+        backend.browseForCreate(dir.path() + "/photos", "");
+        QCOMPARE(picker.folders, 1);
+        picker.cancel();
+        QVERIFY(!backend.browsing());
+        QCOMPARE(chosen.size(), 0);
+        backend.browseForCreate(dir.path() + "/photos", "");
+        picker.send("photos");
+        QVERIFY(!backend.browsing());
+        QCOMPARE(chosen.size(), 0);
+        QVERIFY(backend.error().contains("absolute"));
+        backend.browseForCreate(dir.path() + "/photos", "");
+        picker.send("/srv/photos");
+        QCOMPARE(chosen.size(), 1);
+        QCOMPARE(chosen.first().first().toString(), QString("/srv/photos"));
+        QVERIFY(backend.create("photos", "/srv/photos"));
+        QCOMPARE(backend.rows().first().toMap().value("path").toString(), QString("/srv/photos"));
+    }
+
+    void browseOpensAnImageForIscsiAndSkipsS3() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        FakePicker picker;
+        Backend backend(dir.path(), &commands, &picker);
+        backend.setProtocol(2);
+        backend.browseForCreate("", "clips");
+        QCOMPARE(picker.files, 1);
+        QCOMPARE(picker.title, QString("Disk image"));
+        QCOMPARE(picker.suggested, QString("clips.img"));
+        QVERIFY(QDir(picker.folder).exists());
+        picker.cancel();
+        backend.setProtocol(3);
+        backend.browseForCreate("", "");
+        QCOMPARE(picker.files, 1);
+        QCOMPARE(picker.folders, 0);
+        QVERIFY(backend.error().contains("no folder"));
     }
 
     void themeFallsBack() {

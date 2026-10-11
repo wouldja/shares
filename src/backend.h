@@ -1,5 +1,6 @@
 #pragma once
 
+#include "filepicker.h"
 #include "store.h"
 
 #include <QObject>
@@ -33,9 +34,11 @@ class Backend : public QObject {
     Q_PROPERTY(QString accessLine READ accessLine NOTIFY modelChanged)
     Q_PROPERTY(QString lastOutput READ lastOutput NOTIFY modelChanged)
     Q_PROPERTY(QString createHint READ createHint NOTIFY protocolChanged)
+    Q_PROPERTY(bool browsing READ browsing NOTIFY browsingChanged)
 
 public:
-    explicit Backend(const QString &root = {}, Commands *commands = nullptr, QObject *parent = nullptr);
+    explicit Backend(const QString &root = {}, Commands *commands = nullptr, FilePicker *picker = nullptr,
+                     QObject *parent = nullptr);
 
     int protocol() const { return m_protocol; }
     QString protocolName() const;
@@ -60,6 +63,7 @@ public:
     QString accessLine() const;
     QString lastOutput() const { return m_lastOutput; }
     QString createHint() const;
+    bool browsing() const { return m_browsing; }
 
     Q_INVOKABLE void setProtocol(int protocol);
     Q_INVOKABLE void move(int delta);
@@ -67,6 +71,7 @@ public:
     Q_INVOKABLE void toggle(const QString &key);
     Q_INVOKABLE void toggleEnabled();
     Q_INVOKABLE bool create(const QString &name, const QString &path);
+    Q_INVOKABLE void browseForCreate(const QString &currentPath = {}, const QString &currentName = {});
     Q_INVOKABLE void removeSelected();
     Q_INVOKABLE void undo();
     Q_INVOKABLE void redo();
@@ -91,6 +96,8 @@ signals:
     void historyChanged();
     void errorChanged();
     void dirtyChanged();
+    void browsingChanged();
+    void createPathChosen(const QString &path);
 
 private:
     struct Snapshot {
@@ -121,6 +128,9 @@ private:
     void touch();
     void setDirty(bool dirty);
     void setError(const QString &error);
+    void setBrowsing(bool browsing);
+    void connectPicker();
+    void acceptPickedPath(const QString &path);
     bool runPlan(const Plan &plan, QString *output = nullptr);
     bool commitWithPkexec(const Plan &plan, QString *error, QString *output);
     bool knownBackend(const QString &backend) const;
@@ -152,6 +162,9 @@ private:
     QString m_error;
     QString m_notice;
     QString m_lastOutput;
+    bool m_browsing = false;
+    std::unique_ptr<FilePicker> m_ownedPicker;
+    FilePicker *m_picker = nullptr;
     QVector<Snapshot> m_undo;
     QVector<Snapshot> m_redo;
 };

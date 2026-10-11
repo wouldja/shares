@@ -115,7 +115,28 @@ ApplicationWindow {
     function openCreate() {
         backend.clearError()
         createOpen = true
-        nameField.forceActiveFocus()
+        if (backend.protocol === 3)
+            nameField.forceActiveFocus()
+        else
+            browseForCreate()
+    }
+
+    function browseForCreate() {
+        backend.browseForCreate(pathField.text, nameField.text)
+    }
+
+    function usePickedPath(path) {
+        pathField.text = path
+        if (nameField.text.trim() === "" && backend.protocol !== 1) {
+            var base = path.substring(path.lastIndexOf("/") + 1)
+            if (base.endsWith(".img"))
+                base = base.substring(0, base.length - 4)
+            nameField.text = base
+        }
+        if (backend.protocol === 1)
+            pathField.forceActiveFocus()
+        else
+            nameField.forceActiveFocus()
     }
 
     function clearFilter() {
@@ -126,7 +147,7 @@ ApplicationWindow {
 
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !typing; onActivated: helpOpen = !helpOpen }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: requestQuit() }
-    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: overlay; onActivated: closeOverlays() }
+    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: overlay && !backend.browsing; onActivated: closeOverlays() }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.setProtocol(0) }
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.setProtocol(1) }
     Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.setProtocol(2) }
@@ -147,8 +168,9 @@ ApplicationWindow {
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; enabled: !overlay && !filterField.activeFocus; onActivated: filterField.forceActiveFocus() }
     Shortcut { sequence: "Ctrl+Z"; context: Qt.ApplicationShortcut; enabled: !typing && !createOpen && !removeOpen; onActivated: backend.undo() }
     Shortcut { sequence: "Ctrl+Shift+Z"; context: Qt.ApplicationShortcut; enabled: !typing && !createOpen && !removeOpen; onActivated: backend.redo() }
-    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: createOpen; onActivated: confirmCreate() }
-    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: createOpen; onActivated: confirmCreate() }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: createOpen && !backend.browsing; onActivated: confirmCreate() }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: createOpen && !backend.browsing; onActivated: confirmCreate() }
+    Shortcut { sequence: "Ctrl+O"; context: Qt.ApplicationShortcut; enabled: createOpen && !backend.browsing && backend.protocol !== 3; onActivated: browseForCreate() }
     Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: removeOpen; onActivated: confirmRemove() }
     Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: removeOpen; onActivated: confirmRemove() }
 
@@ -580,6 +602,7 @@ ApplicationWindow {
                     "J K    move through the list",
                     "/    filter",
                     "N    new share, export, target, or bucket",
+                    "Ctrl+O    browse again while creating",
                     "E    edit the selected row",
                     "G    Samba global settings",
                     "I    import or export",
@@ -620,14 +643,30 @@ ApplicationWindow {
                 font.family: win.font.family
                 background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
             }
-            TextField {
-                id: pathField
+            Row {
+                spacing: 8
+                TextField {
+                    id: pathField
+                    width: backend.protocol === 3 ? 384 : 292
+                    placeholderText: backend.protocol === 2 ? "Disk image path" : backend.protocol === 3 ? "Backend" : "Folder"
+                    placeholderTextColor: "#7e8089"
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                    background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                }
+                ActionButton {
+                    visible: backend.protocol !== 3
+                    label: "Browse"
+                    onActivated: win.browseForCreate()
+                }
+            }
+            Text {
+                visible: backend.browsing
                 width: 384
-                placeholderText: backend.protocol === 2 ? "Disk image path" : backend.protocol === 3 ? "Backend" : "Folder"
-                placeholderTextColor: "#7e8089"
-                color: "#a1a3ad"
+                wrapMode: Text.Wrap
+                text: "The browser is open. Create Folder makes the directory. Arrows, Enter, and the mouse all work there."
+                color: "#907f63"
                 font.family: win.font.family
-                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
             }
             Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 384; wrapMode: Text.Wrap; font.family: win.font.family }
             Row {
@@ -636,6 +675,11 @@ ApplicationWindow {
                 ActionButton { label: "Cancel"; key: ""; onActivated: win.createOpen = false }
             }
         }
+    }
+
+    Connections {
+        target: backend
+        function onCreatePathChosen(path) { win.usePickedPath(path) }
     }
 
     Rectangle {

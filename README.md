@@ -43,6 +43,8 @@ A missing tool is named in the window. Shares does not install packages for you.
 
 Names this machine is reachable as are read when the window opens. They are not stored in the program.
 
+New for Samba, NFS, and iSCSI opens the system file browser. Create Folder makes the directory. The list takes the keyboard and the mouse. `Ctrl+O` opens the browser again, and the path can still be typed. That browser needs `xdg-desktop-portal`.
+
 ## Install
 
 Clone the repository and install the package:
@@ -83,7 +85,8 @@ Regenerate the pictures in `docs/` with `docs/mockups/render.py`, then screensho
 | `1` `2` `3` `4` | Samba, NFS, iSCSI, S3 |
 | `J` `K` | Move through the list |
 | `/` | Filter |
-| `N` | New share, export, target, or bucket |
+| `N` | New share, export, target, or bucket. Opens the folder browser |
+| `Ctrl+O` | Open the folder browser again while creating |
 | `E` | Edit the selected row |
 | `G` | Samba global settings |
 | `I` | Import or export this service |
@@ -101,4 +104,4 @@ A field keeps its own keys. `Esc` closes the open dialog. The backdrop does not.
 
 MIT. See [LICENSE](LICENSE).
 
-The theme watcher in `src/theme.cpp` follows Omacut, which is MIT, copyright David Heinemeier Hansson.
+The theme watcher in `src/theme.cpp` and the folder browser in `src/portalfilepicker.cpp` follow Omacut, which is MIT, copyright David Heinemeier Hansson.

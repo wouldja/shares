@@ -1,8 +1,12 @@
 #include "backend.h"
 
+#include "portalfilepicker.h"
+
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDate>
+#include <QDir>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -164,11 +168,35 @@ QString joinSessions(const QStringList &sessions) {
     return sessions.mid(0, 6).join('\n');
 }
 
+QString startFolder(const QString &currentPath) {
+    if (currentPath.startsWith('/')) {
+        const QFileInfo info(currentPath);
+        if (info.isDir())
+            return info.absoluteFilePath();
+        if (info.dir().exists())
+            return info.dir().absolutePath();
+    }
+    return QDir::homePath();
+}
+
+QString imageName(const QString &currentPath, const QString &currentName) {
+    const QFileInfo info(currentPath);
+    if (currentPath.startsWith('/') && !info.isDir() && !info.fileName().isEmpty())
+        return info.fileName();
+    const auto name = currentName.trimmed();
+    if (shareNameOk(name))
+        return name.endsWith(QStringLiteral(".img")) ? name : name + QStringLiteral(".img");
+    return QStringLiteral("disk.img");
+}
+
 } // namespace
 
-Backend::Backend(const QString &root, Commands *commands, QObject *parent)
+Backend::Backend(const QString &root, Commands *commands, FilePicker *picker, QObject *parent)
     : QObject(parent), m_owned(commands ? nullptr : std::make_unique<Commands>()),
-      m_commands(commands ? commands : m_owned.get()), m_root(cleanRoot(root)), m_library(m_root, m_commands) {
+      m_commands(commands ? commands : m_owned.get()), m_root(cleanRoot(root)), m_library(m_root, m_commands),
+      m_picker(picker) {
+    if (m_picker)
+        connectPicker();
     reload();
 }
 
@@ -325,13 +353,13 @@ QString Backend::accessLine() const {
 QString Backend::createHint() const {
     switch (m_protocol) {
     case 1:
-        return QStringLiteral("Adds an export for every client (*). Change the clients with Edit, then Save.");
+        return QStringLiteral("The folder browser opens so you can pick or create the export. Arrows and the mouse both move through it. Change the clients with Edit, then Save.");
     case 2:
-        return QStringLiteral("Save creates the disk image. Removing the target leaves that image in place.");
+        return QStringLiteral("The file browser opens so you can place the disk image. Create Folder makes its directory. Save creates the image. Removing the target leaves that image in place.");
     case 3:
         return QStringLiteral("Creates the bucket on the named backend now. Ceph buckets are created through the S3 API, not here.");
     default:
-        return QStringLiteral("Adds a share. The name and folder stay fixed after this. Save writes it.");
+        return QStringLiteral("The folder browser opens so you can pick or create the folder. Arrows and the mouse both move through it. The name stays fixed after this. Save writes it.");
     }
 }
 
@@ -661,6 +689,55 @@ void Backend::toggleEnabled() {
         m_iscsi.targets[index].enabled = !m_iscsi.targets[index].enabled;
     setDirty(true);
     touch();
+}
+
+void Backend::setBrowsing(bool browsing) {
+    if (m_browsing == browsing)
+        return;
+    m_browsing = browsing;
+    emit browsingChanged();
+}
+
+void Backend::connectPicker() {
+    connect(m_picker, &FilePicker::chosen, this, &Backend::acceptPickedPath);
+    connect(m_picker, &FilePicker::cancelled, this, [this] { setBrowsing(false); });
+    connect(m_picker, &FilePicker::failed, this, [this](const QString &message) {
+        setBrowsing(false);
+        setError(message);
+    });
+}
+
+void Backend::acceptPickedPath(const QString &path) {
+    setBrowsing(false);
+    if (!absolutePathOk(path)) {
+        setError(m_protocol == 2 ? QStringLiteral("The disk image path has to be an absolute path.")
+                 : m_protocol == 1 ? QStringLiteral("An export needs an absolute folder.")
+                                   : QStringLiteral("A share path has to be an absolute path."));
+        return;
+    }
+    setError({});
+    emit createPathChosen(path);
+}
+
+void Backend::browseForCreate(const QString &currentPath, const QString &currentName) {
+    if (m_browsing)
+        return;
+    if (m_protocol == 3) {
+        setError(QStringLiteral("S3 buckets have no folder. Name the backend instead."));
+        return;
+    }
+    if (!m_picker) {
+        m_ownedPicker = std::make_unique<PortalFilePicker>();
+        m_picker = m_ownedPicker.get();
+        connectPicker();
+    }
+    setBrowsing(true);
+    const auto folder = startFolder(currentPath);
+    if (m_protocol == 2)
+        m_picker->chooseNewFile(QStringLiteral("Disk image"), folder, imageName(currentPath, currentName));
+    else
+        m_picker->chooseFolder(m_protocol == 1 ? QStringLiteral("Folder to export") : QStringLiteral("Folder to share"),
+                               folder);
 }
 
 bool Backend::create(const QString &name, const QString &path) {
