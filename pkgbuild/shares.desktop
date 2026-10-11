@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Shares
+Comment=Publish folders over Samba, NFS, iSCSI, and S3
+Exec=shares
+Icon=shares
+Terminal=false
+Categories=Network;
+StartupWMClass=shares
