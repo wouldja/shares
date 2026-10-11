@@ -44,12 +44,21 @@ public:
     void trustNextKey();
 
 private:
+    QString controlSocket();
+
     QString m_target;
     int m_port = 22;
     bool m_tailscaleSsh = false;
     bool m_trustNext = false;
+    bool m_controlReady = false;
+    QString m_controlPath;
     QMutex m_execLock;
 };
+
+// Client argv up to, but not including, the remote command. An empty control
+// path, a Tailscale SSH destination, or a too-long socket skips multiplexing.
+QStringList sshLaunchArgs(bool tailscaleSsh, const QString &target, int port, bool trustNext,
+                          const QString &controlPath);
 
 // Library probes (systemctl, hostname, targetcli) go through this while a
 // remote computer is selected. File bodies travel separately, on stdin.
@@ -59,9 +68,11 @@ public:
 
     CommandResult run(const QString &program, const QStringList &args, const QString &input = {},
                       int timeoutMs = 8000) override;
-    // One SSH session per call. Parallel probes would open a crowd of sessions
-    // and race the host-key trust flag.
+    // Probes share one remote shell. Parallel SSH would open a crowd of sessions
+    // and race the host-key trust flag. Later commands reuse the OpenSSH socket.
     bool parallelProbes() const override { return false; }
+    bool batchProbes() const override { return true; }
+    QHash<QString, CommandResult> runBatch(const QVector<ProbeRequest> &probes) override;
     int probeTimeoutMs() const override { return 8000; }
 
 private:
@@ -75,6 +86,9 @@ QStringList missingPackages(const OsProfile &profile, bool samba, bool nfs, bool
 QString installCommand(const OsProfile &profile, const QStringList &packages);
 QVector<QStringList> installArgv(const OsProfile &profile, const QStringList &packages);
 RemoteNeed probeRemote(RemoteLink *link);
+// One remote shell reads the OS, passwordless sudo, and the tool paths.
+QStringList remoteProbeArgv();
+QStringList remoteProbeToolPaths();
 bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error);
 // One remote command reads the bounded share files. The payload is length-prefixed
 // text. writeRemoteBundle ignores any path outside that fixed set.

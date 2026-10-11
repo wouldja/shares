@@ -73,9 +73,7 @@ public:
     QStringList inputs;
     bool installed = false;
 
-    CommandResult exec(const QStringList &argv, const QString &input, int) override {
-        calls.append(argv);
-        inputs.append(input);
+    CommandResult lookup(const QStringList &argv) {
         const auto key = argv.join(' ');
         for (int i = 0; i < queued.size(); ++i) {
             if (queued.at(i).first == key) {
@@ -97,6 +95,44 @@ public:
         if (argv.value(0) == "hostname")
             return {0, "pve\n", {}, false};
         return {1, {}, {}, false};
+    }
+
+    // The connect probe is one shell. Older stubs still describe cat, sudo, and
+    // test -x, and this builds the same report the remote script would print.
+    CommandResult synthesizeProbe() {
+        const auto os = lookup({"cat", "/etc/os-release"});
+        if (os.code != 0)
+            return os;
+        QString out = os.out;
+        if (!out.endsWith('\n'))
+            out += '\n';
+        out += "SHARES-PROBE\n";
+        const auto sudo = lookup({"sudo", "-n", "true"});
+        out += sudo.code == 0 ? "SUDO 0\n" : "SUDO 1\n";
+        for (const auto &path : remoteProbeToolPaths()) {
+            const auto tool = lookup({"test", "-x", path});
+            out += QString("TOOL %1 %2\n").arg(path, tool.code == 0 ? "0" : "1");
+        }
+        return {0, out, {}, false};
+    }
+
+    CommandResult exec(const QStringList &argv, const QString &input, int) override {
+        calls.append(argv);
+        inputs.append(input);
+        if (argv == remoteProbeArgv()) {
+            const auto key = argv.join(' ');
+            for (int i = 0; i < queued.size(); ++i) {
+                if (queued.at(i).first == key) {
+                    const auto result = queued.at(i).second;
+                    queued.removeAt(i);
+                    return result;
+                }
+            }
+            if (exact.contains(key))
+                return exact.value(key);
+            return synthesizeProbe();
+        }
+        return lookup(argv);
     }
 };
 
@@ -811,8 +847,9 @@ private slots:
         QVERIFY(backend.remote());
         QCOMPARE(backend.hostTitle(), QString("bandc"));
         int releases = 0;
+        const auto probe = remoteProbeArgv().join(' ');
         for (const auto &call : link.calls) {
-            if (call.join(' ') == "cat /etc/os-release")
+            if (call.join(' ') == probe)
                 ++releases;
         }
         QCOMPARE(releases, 3);
@@ -866,6 +903,104 @@ private slots:
         QVERIFY(!QFile::exists(dir.path() + "/etc/passwd"));
         QVERIFY(remoteBundleArgv().join(' ').contains("emit /etc/samba/shares.conf"));
         QCOMPARE(remoteBundleArgv().size(), 5);
+    }
+
+    void remoteProbeIsOneShell() {
+        class LocalShell : public RemoteLink {
+        public:
+            int calls = 0;
+            CommandResult exec(const QStringList &argv, const QString &, int) override {
+                ++calls;
+                if (argv != remoteProbeArgv())
+                    return {1, {}, "unexpected", false};
+                auto script = argv.at(2);
+                if (!script.startsWith('\'') || !script.endsWith('\''))
+                    return {1, {}, "unquoted", false};
+                script = script.mid(1, script.size() - 2);
+                script.replace(QStringLiteral("'\\''"), QStringLiteral("'"));
+                QProcess process;
+                process.start(QStringLiteral("sh"), {QStringLiteral("-c"), script});
+                if (!process.waitForFinished(20000))
+                    return {124, {}, "timed out", false};
+                return {process.exitCode(), QString::fromUtf8(process.readAllStandardOutput()),
+                        QString::fromUtf8(process.readAllStandardError()), false};
+            }
+        };
+        LocalShell link;
+        const auto need = probeRemote(&link);
+        QCOMPARE(link.calls, 1);
+        QVERIFY(need.connected);
+        QVERIFY(need.profile.family == "arch" || need.profile.family == "debian");
+        if (need.sudo)
+            QVERIFY(!need.error.contains("passwordless"));
+        else
+            QVERIFY(need.error.contains("passwordless"));
+        QVERIFY(remoteProbeArgv().join(' ').contains("cat /etc/os-release"));
+        QVERIFY(remoteProbeArgv().join(' ').contains("sudo -n true"));
+        QVERIFY(remoteProbeArgv().join(' ').contains("/usr/bin/python3"));
+    }
+
+    void remoteStatusAndS3UseOneShellEach() {
+        class LocalShell : public RemoteLink {
+        public:
+            QVector<QStringList> calls;
+            CommandResult exec(const QStringList &argv, const QString &, int) override {
+                calls.append(argv);
+                if (argv.value(0) != "sh" || argv.size() != 3)
+                    return {1, {}, "not a batch", false};
+                auto script = argv.at(2);
+                if (script.startsWith('\'') && script.endsWith('\'')) {
+                    script = script.mid(1, script.size() - 2);
+                    script.replace(QStringLiteral("'\\''"), QStringLiteral("'"));
+                }
+                QProcess process;
+                process.start(QStringLiteral("sh"), {QStringLiteral("-c"), script});
+                if (!process.waitForFinished(30000))
+                    return {124, {}, "timed out", false};
+                return {process.exitCode(), QString::fromUtf8(process.readAllStandardOutput()),
+                        QString::fromUtf8(process.readAllStandardError()), false};
+            }
+        };
+        QTemporaryDir dir;
+        LocalShell link;
+        RemoteCommands commands(&link);
+        Library library(dir.path(), &commands);
+        library.loadStatus();
+        QCOMPARE(link.calls.size(), 1);
+        QVERIFY(link.calls.first().join(' ').contains("SHARES-BATCH"));
+        QVERIFY(link.calls.first().join(' ').contains("systemctl"));
+        QVERIFY(link.calls.first().join(' ').contains("tailscale"));
+        QVERIFY(library.sambaState.contains(" is "));
+        QVERIFY(!library.reachable.isEmpty());
+
+        library.loadS3();
+        QCOMPARE(link.calls.size(), 2);
+        QVERIFY(link.calls.last().join(' ').contains("mc"));
+        QVERIFY(link.calls.last().join(' ').contains("radosgw-admin"));
+        QVERIFY(!library.s3State.isEmpty());
+    }
+
+    void openSshReusesAControlSocket() {
+        const auto plain = sshLaunchArgs(false, "share@files.example.net", 22, false, "/run/user/1000/shares-ssh/%C");
+        QVERIFY(plain.contains("ControlMaster=auto"));
+        QVERIFY(plain.contains("ControlPersist=600"));
+        QVERIFY(plain.contains("ControlPath=/run/user/1000/shares-ssh/%C"));
+        QVERIFY(plain.contains("BatchMode=yes"));
+        QVERIFY(plain.contains("StrictHostKeyChecking=yes"));
+        QVERIFY(!plain.contains("tailscale"));
+
+        const auto trust = sshLaunchArgs(false, "share@files.example.net", 22, true, "/run/user/1000/shares-ssh/%C");
+        QVERIFY(trust.contains("StrictHostKeyChecking=accept-new"));
+        QVERIFY(!trust.contains("StrictHostKeyChecking=yes"));
+
+        const auto tailscale = sshLaunchArgs(true, "share@files.example.net", 22, false, "/run/user/1000/shares-ssh/%C");
+        QCOMPARE(tailscale.first(), QString("tailscale"));
+        QVERIFY(!tailscale.join(' ').contains("ControlMaster"));
+
+        const auto skipped = sshLaunchArgs(false, "share@files.example.net", 22, false, QString(90, 'a'));
+        QVERIFY(!skipped.join(' ').contains("ControlMaster"));
+        const auto empty = sshLaunchArgs(false, "share@files.example.net", 22, false, {});
+        QVERIFY(!empty.join(' ').contains("ControlMaster"));
     }
 
     void themeFallsBack() {

@@ -37,17 +37,14 @@ QString serviceState(const CommandResult &result, const QString &unit, const QSt
     return unit + " is " + state;
 }
 
-struct ProbeCall {
-    QString id;
-    QString program;
-    QStringList args;
-    int timeoutMs = 2500;
-};
-
-QHash<QString, CommandResult> runProbes(Commands *commands, const QVector<ProbeCall> &probes) {
+QHash<QString, CommandResult> runProbes(Commands *commands, const QVector<ProbeRequest> &probes) {
     QHash<QString, CommandResult> out;
     if (!commands || probes.isEmpty())
         return out;
+    // One remote shell for the whole list. A single probe, and every local
+    // probe, still runs on its own.
+    if (commands->batchProbes() && probes.size() > 1)
+        return commands->runBatch(probes);
     if (!commands->parallelProbes() || probes.size() == 1) {
         for (const auto &probe : probes)
             out.insert(probe.id, commands->run(probe.program, probe.args, {}, probe.timeoutMs));
@@ -103,6 +100,13 @@ bool loopbackOrigin(const QString &url) {
 }
 
 Commands::~Commands() = default;
+
+QHash<QString, CommandResult> Commands::runBatch(const QVector<ProbeRequest> &probes) {
+    QHash<QString, CommandResult> out;
+    for (const auto &probe : probes)
+        out.insert(probe.id, run(probe.program, probe.args, {}, probe.timeoutMs));
+    return out;
+}
 
 CommandResult Commands::run(const QString &program, const QStringList &args, const QString &input, int timeoutMs) {
     if (QStandardPaths::findExecutable(program).isEmpty())
@@ -176,7 +180,7 @@ void Library::loadStatus() {
     if (!m_commands)
         return;
     const int timeout = m_commands->probeTimeoutMs();
-    QVector<ProbeCall> probes = {
+    QVector<ProbeRequest> probes = {
         {"samba", "systemctl", {"is-active", m_profile.sambaUnit}, timeout},
         {"nfs", "systemctl", {"is-active", m_profile.nfsUnit}, timeout},
         {"iscsi", "systemctl", {"is-active", m_profile.iscsiUnit}, timeout},
@@ -237,7 +241,9 @@ void Library::loadS3() {
     const int curlTimeout = qMax(timeout, 4000);
     const auto bucketsUrl = rustfsEndpoint + "/rustfs/admin/v3/buckets";
     const auto curl = rustfsCurl({}, bucketsUrl);
-    QVector<ProbeCall> probes = {
+    // Detection and the bucket lists share one probe list, so a remote computer
+    // answers in one shell instead of a second wave after the first returns.
+    QVector<ProbeRequest> probes = {
         {"minio-unit", "systemctl", {"is-active", "minio"}, timeout},
         {"garage-unit", "systemctl", {"is-active", "garage"}, timeout},
         {"ceph-unit", "systemctl", {"is-active", "ceph-radosgw"}, timeout},
@@ -246,6 +252,12 @@ void Library::loadS3() {
         {"garage", "garage", {"--version"}, timeout},
         {"radosgw-admin", "radosgw-admin", {"--version"}, timeout},
         {"rustfs-curl", curl.first(), curl.mid(1), curlTimeout},
+        {"minio-buckets", "mc", {"ls", "local"}, timeout},
+        {"minio-access", "mc", {"admin", "user", "list", "local"}, timeout},
+        {"garage-buckets", "garage", {"bucket", "list"}, timeout},
+        {"garage-access", "garage", {"key", "list"}, timeout},
+        {"ceph-buckets", "radosgw-admin", {"bucket", "list"}, timeout},
+        {"ceph-access", "radosgw-admin", {"user", "list"}, timeout},
     };
     const auto result = runProbes(m_commands, probes);
     const auto toolReady = [&result](const QString &id) {
@@ -267,26 +279,12 @@ void Library::loadS3() {
         s3Backends << "rustfs";
     s3State = s3Backends.isEmpty() ? "no S3 backend is installed" : s3Backends.join(", ");
     s3 = {};
-    QVector<ProbeCall> lists;
-    for (const auto &backend : s3Backends) {
-        if (backend == "minio") {
-            lists.append({"minio-buckets", "mc", {"ls", "local"}, timeout});
-            lists.append({"minio-access", "mc", {"admin", "user", "list", "local"}, timeout});
-        } else if (backend == "garage") {
-            lists.append({"garage-buckets", "garage", {"bucket", "list"}, timeout});
-            lists.append({"garage-access", "garage", {"key", "list"}, timeout});
-        } else if (backend == "ceph") {
-            lists.append({"ceph-buckets", "radosgw-admin", {"bucket", "list"}, timeout});
-            lists.append({"ceph-access", "radosgw-admin", {"user", "list"}, timeout});
-        }
-    }
-    const auto listed = runProbes(m_commands, lists);
     for (const auto &backend : s3Backends) {
         CommandResult buckets;
         if (backend == "rustfs")
             buckets = rustfsProbe;
         else
-            buckets = listed.value(backend + "-buckets");
+            buckets = result.value(backend + "-buckets");
         if (!buckets.missing && buckets.code == 0)
             s3.buckets += parseBucketList(backend, buckets.out);
         else if (!buckets.missing && !buckets.err.trimmed().isEmpty()) {
@@ -296,7 +294,7 @@ void Library::loadS3() {
         }
         if (backend == "rustfs")
             continue;
-        const auto access = listed.value(backend + "-access");
+        const auto access = result.value(backend + "-access");
         if (!access.missing && access.code == 0) {
             for (const auto &name : parseAccessList(backend, access.out))
                 s3.access.append({backend, name, backend == "garage" ? "key" : "user"});

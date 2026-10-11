@@ -3,14 +3,24 @@
 #include "config.h"
 
 #include <QByteArray>
+#include <QHash>
 #include <QObject>
 #include <QStringList>
+#include <QVector>
 
 struct CommandResult {
     int code = 1;
     QString out;
     QString err;
     bool missing = false;
+};
+
+// One read-only probe. id is a token we generate, not a path from the user.
+struct ProbeRequest {
+    QString id;
+    QString program;
+    QStringList args;
+    int timeoutMs = 2500;
 };
 
 class Commands {
@@ -21,6 +31,9 @@ public:
     virtual CommandResult run(const QString &program, const QStringList &args, const QString &input = {},
                               int timeoutMs = 8000);
     virtual bool parallelProbes() const { return true; }
+    // A remote shell can run the whole list in one session. Local probes stay separate.
+    virtual bool batchProbes() const { return false; }
+    virtual QHash<QString, CommandResult> runBatch(const QVector<ProbeRequest> &probes);
     virtual int probeTimeoutMs() const { return 2500; }
 };
 
