@@ -35,6 +35,23 @@ Removing a share, export, or target removes that definition only. The folder or 
 
 Samba can set guest access, read only, browsable, inherit permissions, valid users, Windows ACLs, ZFS or Ceph shadow copies, the MacOS fruit preset, audit logging, a directory mode, and creating a missing folder. Extra `smb.conf` keys are kept. Global settings cover the workgroup, server string, log level, and the MacOS preset. A Samba password does not change the Linux login password.
 
+## ZFS
+
+A folder on a ZFS dataset can be a Samba share or an NFS export. A file on that dataset can be an iSCSI disk image. A zvol can be an iSCSI block device when its path is `/dev/zvol/pool/name` and the backstore kind is block.
+
+Turn on Shadow copy for a Samba share. The shadow kind stays `zfs` unless you set it to `ceph`. Save then writes:
+
+```
+vfs objects = shadow_copy2
+shadow:snapdir = .zfs/snapshot
+shadow:sort = desc
+shadow:format = %Y-%m-%d-%H%M%S
+```
+
+Windows Previous Versions lists those snapshots when the share path is the dataset mount, so `.zfs/snapshot` is inside that folder, and each snapshot name looks like `2026-10-11-143000`.
+
+Shares does not create datasets, snapshots, or zvols. Create Folder makes a directory on the dataset that is already mounted. Snapshots stay a `zfs snapshot` job. An NFS export is written to `/etc/exports.d/shares.exports`. Removing a share, export, or target leaves the dataset, its snapshots, and any zvol in place.
+
 NFS exports take one or more clients, each with its own options. iSCSI targets take a file or block backstore, portals, initiator groups, and CHAP. Clustered mode creates an RBD image and uses `gwcli` when those tools are installed. It does not manage Pacemaker or Ceph monitors.
 
 S3 lists, creates, and deletes buckets for MinIO (`mc` alias `local`), Garage, and RustFS, and lists and removes empty Ceph RGW buckets. Access users and keys can be created for MinIO, Garage, and Ceph. Ceph creates a bucket through the S3 API, so this window does not. RustFS access keys are listed and not created here. Policies, groups, versioning, and object lock are not in this window.

@@ -30,7 +30,7 @@ html, body {
   font-family: "JetBrainsMono NF", "JetBrains Mono", ui-monospace, monospace;
   font-size: 12px; line-height: 1.35;
 }
-.app { width: 1200px; height: 760px; display: flex; flex-direction: column; border: 1px solid var(--border); }
+.app { position: relative; width: 1200px; height: 760px; display: flex; flex-direction: column; border: 1px solid var(--border); }
 .top, .bottom { flex: none; display: flex; align-items: center; }
 .top { height: 42px; justify-content: space-between; padding: 0 14px 0 16px; border-bottom: 1px solid var(--hairline); }
 .bottom { height: 36px; gap: 16px; padding: 0 16px; border-top: 1px solid var(--hairline); color: var(--secondary); }
@@ -114,6 +114,21 @@ h1 { font-size: 14px; font-weight: 700; color: var(--bright); }
 .chev { color: var(--secondary); }
 .detail-foot { margin-top: auto; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .bottom b { color: var(--fg); font-weight: 500; }
+.shade { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.60); }
+.dialog {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 420px; background: var(--bg); border: 1px solid var(--border); padding: 18px;
+}
+.dialog h3 { font-size: 16px; font-weight: 700; color: var(--bright); margin-bottom: 10px; }
+.dialog p { color: var(--secondary); margin-bottom: 10px; }
+.field {
+  height: 32px; display: flex; align-items: center; padding: 0 10px; margin-bottom: 10px;
+  background: var(--inset); border: 1px solid var(--border); color: var(--secondary);
+}
+.path-row { display: flex; gap: 8px; margin-bottom: 10px; }
+.path-row .field { flex: 1; margin-bottom: 0; }
+.note { color: var(--yellow); margin-bottom: 10px; }
+.actions { display: flex; gap: 8px; }
 """
 
 NAV = [
@@ -152,6 +167,28 @@ def row(item, selected):
 def switch(label, on):
     klass = "switch on" if on else "switch"
     return f'<div class="switch-row"><span>{label}</span><span class="{klass}"><span class="thumb"></span></span></div>'
+
+
+def dialog(spec):
+    form = spec.get("dialog")
+    if not form:
+        return ""
+    return f"""
+    <div class="shade"></div>
+    <div class="dialog">
+      <h3>{form["title"]}</h3>
+      <p>{form["hint"]}</p>
+      <div class="field">{form["name"]}</div>
+      <div class="path-row">
+        <div class="field">{form["path"]}</div>
+        <button class="btn">Browse</button>
+      </div>
+      <p class="note">{form["note"]}</p>
+      <div class="actions">
+        <button class="btn primary">Create</button>
+        <button class="btn">Cancel</button>
+      </div>
+    </div>"""
 
 
 def page(spec):
@@ -234,6 +271,7 @@ def page(spec):
       <span>{kbd("Space")} enable</span>
       <span><b>placeholder names</b></span>
     </footer>
+    {dialog(spec)}
   </div>
 </body>
 </html>
@@ -261,6 +299,13 @@ PAGES = [
             ("WHO", "ada · read and write"),
             ("CONNECTED", "desk <span>· quiet</span>"),
         ],
+        "dialog": {
+            "title": "New samba",
+            "hint": "The folder browser opens so you can pick or create the folder. Arrows and the mouse both move through it.",
+            "name": "Name",
+            "path": "Folder",
+            "note": "The browser is open. Create Folder makes the directory. Arrows, Enter, and the mouse all work there.",
+        },
     },
     {
         "id": "nfs",
