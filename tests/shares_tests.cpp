@@ -204,6 +204,8 @@ private slots:
         QVERIFY(joined.contains("mkdir"));
         QVERIFY(joined.contains("chmod"));
         QVERIFY(!joined.contains(" rm "));
+        QVERIFY(!joined.contains("targetcli saveconfig"));
+        QVERIFY(!joined.contains("systemctl start target"));
         QVERIFY(backend.create("clips", "/tmp/$(id)"));
         QVERIFY(backend.applyEditor("create path=yes\nadvanced:\n"));
         QVERIFY(!backend.save());
@@ -237,6 +239,7 @@ private slots:
         const auto backing = backend.detail().value("facts").toList().first().toMap().value("value").toString();
         QVERIFY(backing.contains("/srv/iscsi/clips.img"));
         QVERIFY(backend.save());
+        QVERIFY(joinedCalls(commands.calls).contains("targetcli saveconfig"));
         const auto record = readFile(dir.path() + "/etc/shares/iscsi.json");
         QVERIFY(record.contains("/srv/iscsi/clips.img"));
         const auto perms = QFileInfo(dir.path() + "/etc/shares/iscsi.json").permissions();
@@ -251,6 +254,7 @@ private slots:
             removed << commands.calls.at(i);
         const auto joined = joinedCalls(removed);
         QVERIFY(joined.contains("delete"));
+        QVERIFY(joined.contains("targetcli saveconfig"));
         QVERIFY(!joined.contains("/srv/iscsi/clips.img"));
         QVERIFY(!joined.contains(" rm "));
     }

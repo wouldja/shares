@@ -559,7 +559,9 @@ QStringList iscsiApplyCommands(const IscsiConfig &config) {
         }
         commands << QString("%1 /iscsi/%2/tpg1 %3").arg(tool, target.iqn, target.enabled ? "enable" : "disable");
     }
-    if (!config.clustered)
+    // An empty config has nothing to persist. Calling saveconfig anyway makes
+    // every Samba or NFS save fail on a machine without targetcli-fb.
+    if (!config.clustered && (!config.devices.isEmpty() || !config.targets.isEmpty()))
         commands << "targetcli saveconfig";
     return commands;
 }

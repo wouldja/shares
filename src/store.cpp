@@ -326,6 +326,16 @@ Plan Library::plan(const SambaConfig &nextSamba, const QVector<NfsExport> &nextN
         }
         plan.commands.append({args, {}});
     }
+    // Deleting the last target does not go through iscsiApplyCommands, but the
+    // deletion still has to be saved. Skip saveconfig when targetcli was never
+    // invoked, so a share save does not require the iSCSI package.
+    bool ranTargetcli = false;
+    for (const auto &command : plan.commands) {
+        if (!command.args.isEmpty() && command.args.first() == "targetcli")
+            ranTargetcli = true;
+    }
+    if (ranTargetcli && plan.commands.last().args != QStringList{"targetcli", "saveconfig"})
+        plan.commands.append({{"targetcli", "saveconfig"}, {}});
     const bool sambaWork = !nextSamba.shares.isEmpty() || !samba.shares.isEmpty() || smbHadShares;
     const bool nfsWork = !nextNfs.isEmpty() || !nfs.isEmpty();
     const bool iscsiWork = !nextIscsi.targets.isEmpty() || !nextIscsi.devices.isEmpty() || !iscsi.targets.isEmpty()
