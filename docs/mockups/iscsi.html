@@ -25,7 +25,7 @@ html, body {
   font-family: "JetBrainsMono NF", "JetBrains Mono", ui-monospace, monospace;
   font-size: 12px; line-height: 1.35;
 }
-.app { width: 1200px; height: 760px; display: flex; flex-direction: column; border: 1px solid var(--border); }
+.app { position: relative; width: 1200px; height: 760px; display: flex; flex-direction: column; border: 1px solid var(--border); }
 .top, .bottom { flex: none; display: flex; align-items: center; }
 .top { height: 42px; justify-content: space-between; padding: 0 14px 0 16px; border-bottom: 1px solid var(--hairline); }
 .bottom { height: 36px; gap: 16px; padding: 0 16px; border-top: 1px solid var(--hairline); color: var(--secondary); }
@@ -109,6 +109,21 @@ h1 { font-size: 14px; font-weight: 700; color: var(--bright); }
 .chev { color: var(--secondary); }
 .detail-foot { margin-top: auto; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .bottom b { color: var(--fg); font-weight: 500; }
+.shade { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.60); }
+.dialog {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 420px; background: var(--bg); border: 1px solid var(--border); padding: 18px;
+}
+.dialog h3 { font-size: 16px; font-weight: 700; color: var(--bright); margin-bottom: 10px; }
+.dialog p { color: var(--secondary); margin-bottom: 10px; }
+.field {
+  height: 32px; display: flex; align-items: center; padding: 0 10px; margin-bottom: 10px;
+  background: var(--inset); border: 1px solid var(--border); color: var(--secondary);
+}
+.path-row { display: flex; gap: 8px; margin-bottom: 10px; }
+.path-row .field { flex: 1; margin-bottom: 0; }
+.note { color: var(--yellow); margin-bottom: 10px; }
+.actions { display: flex; gap: 8px; }
 </style>
 </head>
 <body>
@@ -187,6 +202,7 @@ h1 { font-size: 14px; font-weight: 700; color: var(--bright); }
       <span><kbd>Space</kbd> enable</span>
       <span><b>placeholder names</b></span>
     </footer>
+    
   </div>
 </body>
 </html>
