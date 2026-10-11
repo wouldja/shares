@@ -1,9 +1,11 @@
 #pragma once
 
 #include "filepicker.h"
+#include "remote.h"
 #include "store.h"
 
 #include <QObject>
+#include <QTemporaryDir>
 #include <QVariant>
 #include <memory>
 
@@ -35,10 +37,15 @@ class Backend : public QObject {
     Q_PROPERTY(QString lastOutput READ lastOutput NOTIFY modelChanged)
     Q_PROPERTY(QString createHint READ createHint NOTIFY protocolChanged)
     Q_PROPERTY(bool browsing READ browsing NOTIFY browsingChanged)
+    Q_PROPERTY(QString hostTitle READ hostTitle NOTIFY hostChanged)
+    Q_PROPERTY(QVariantList hosts READ hosts NOTIFY hostChanged)
+    Q_PROPERTY(QString needsText READ needsText NOTIFY hostChanged)
+    Q_PROPERTY(bool canInstall READ canInstall NOTIFY hostChanged)
+    Q_PROPERTY(bool canTrustHost READ canTrustHost NOTIFY hostChanged)
 
 public:
     explicit Backend(const QString &root = {}, Commands *commands = nullptr, FilePicker *picker = nullptr,
-                     QObject *parent = nullptr);
+                     RemoteLink *link = nullptr, QObject *parent = nullptr);
 
     int protocol() const { return m_protocol; }
     QString protocolName() const;
@@ -64,6 +71,12 @@ public:
     QString lastOutput() const { return m_lastOutput; }
     QString createHint() const;
     bool browsing() const { return m_browsing; }
+    QString hostTitle() const { return m_hostTitle; }
+    QVariantList hosts() const { return m_hostRows; }
+    QString needsText() const { return m_needsText; }
+    bool canInstall() const { return m_canInstall; }
+    bool canTrustHost() const { return m_canTrustHost; }
+    void setHostsFile(const QString &path) { m_hostsFile = path; }
 
     Q_INVOKABLE void setProtocol(int protocol);
     Q_INVOKABLE void move(int delta);
@@ -89,6 +102,11 @@ public:
     Q_INVOKABLE bool removeSambaPassword(const QString &user);
     Q_INVOKABLE bool createAccess(const QString &backend, const QString &name, const QString &secret);
     Q_INVOKABLE bool removeAccess(const QString &backend, const QString &name);
+    Q_INVOKABLE void refreshHosts();
+    Q_INVOKABLE bool useHost(const QString &id);
+    Q_INVOKABLE bool addHost(const QString &user, const QString &host, int port);
+    Q_INVOKABLE bool installNeeds();
+    Q_INVOKABLE bool trustHost();
 
 signals:
     void protocolChanged();
@@ -98,6 +116,8 @@ signals:
     void dirtyChanged();
     void browsingChanged();
     void createPathChosen(const QString &path);
+    void hostChanged();
+    void needsReady();
 
 private:
     struct Snapshot {
@@ -134,9 +154,39 @@ private:
     bool runPlan(const Plan &plan, QString *output = nullptr);
     bool commitWithPkexec(const Plan &plan, QString *error, QString *output);
     bool knownBackend(const QString &backend) const;
+    QString hostsPath() const;
+    void loadSavedHosts();
+    void writeSavedHosts() const;
+    void publishHosts();
+    bool connectRemote(const RemoteHost &host);
+    void useLocal();
+    QString localUser() const;
+    RemoteHost hostById(const QString &id) const;
 
     std::unique_ptr<Commands> m_owned;
+    Commands *m_localCommands = nullptr;
     Commands *m_commands = nullptr;
+    std::unique_ptr<RemoteLink> m_ownedLink;
+    RemoteLink *m_link = nullptr;
+    RemoteLink *m_injectedLink = nullptr;
+    std::unique_ptr<RemoteCommands> m_remoteCommands;
+    std::unique_ptr<QTemporaryDir> m_mirror;
+    QString m_appRoot;
+    QString m_hostsFile;
+    QString m_hostTitle = QStringLiteral("This computer");
+    QString m_needsText;
+    QString m_pendingUser;
+    QString m_pendingHost;
+    int m_pendingPort = 22;
+    bool m_pendingTailscaleSsh = false;
+    bool m_canInstall = false;
+    bool m_canTrustHost = false;
+    QVariantList m_hostRows;
+    QVector<RemoteHost> m_saved;
+    QVector<RemoteHost> m_peers;
+    OsProfile m_localProfile;
+    OsProfile m_remoteProfile;
+    QStringList m_neededPackages;
     QString m_root;
     Library m_library;
     SambaConfig m_samba;

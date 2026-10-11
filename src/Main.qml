@@ -27,10 +27,14 @@ ApplicationWindow {
     property bool globalOpen: false
     property bool importOpen: false
     property bool quitOpen: false
+    property bool hostsOpen: false
+    property bool needsOpen: false
+    property int hostCursor: 0
     readonly property bool typing: filterField.activeFocus || nameField.activeFocus || pathField.activeFocus
         || editorField.activeFocus || globalField.activeFocus || importField.activeFocus
         || accountField.activeFocus || secretField.activeFocus || serviceField.activeFocus
-    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen
+        || hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus
+    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || needsOpen
     readonly property bool letters: !overlay && !typing
 
     function closeOverlays() {
@@ -42,6 +46,8 @@ ApplicationWindow {
         globalOpen = false
         importOpen = false
         quitOpen = false
+        hostsOpen = false
+        needsOpen = false
     }
 
     function requestQuit() {
@@ -145,6 +151,35 @@ ApplicationWindow {
         filterField.focus = false
     }
 
+    function openHosts() {
+        backend.refreshHosts()
+        hostCursor = 0
+        hostsOpen = true
+    }
+
+    function moveHost(delta) {
+        var count = backend.hosts.length
+        if (count < 1)
+            return
+        hostCursor = (hostCursor + delta + count) % count
+    }
+
+    function connectTypedHost() {
+        if (backend.addHost(hostUserField.text, hostNameField.text, parseInt(hostPortField.text)))
+            hostsOpen = false
+    }
+
+    function activateHost() {
+        if (hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus) {
+            connectTypedHost()
+            return
+        }
+        if (hostCursor < 0 || hostCursor >= backend.hosts.length)
+            return
+        if (backend.useHost(backend.hosts[hostCursor].id))
+            hostsOpen = false
+    }
+
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !typing; onActivated: helpOpen = !helpOpen }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: requestQuit() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: overlay && !backend.browsing; onActivated: closeOverlays() }
@@ -163,6 +198,13 @@ ApplicationWindow {
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.toggleEnabled() }
     Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.copyAddress() }
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openCreate() }
+    Shortcut { sequence: "H"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openHosts() }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(1) }
+    Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(1) }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: hostsOpen; onActivated: activateHost() }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: hostsOpen; onActivated: activateHost() }
     Shortcut { sequence: "D"; context: Qt.ApplicationShortcut; enabled: letters && backend.hasSelection; onActivated: removeOpen = true }
     Shortcut { sequence: "U"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: passwordsOpen = true }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; enabled: !overlay && !filterField.activeFocus; onActivated: filterField.forceActiveFocus() }
@@ -227,7 +269,20 @@ ApplicationWindow {
             Layout.preferredHeight: 42
             color: "#16161e"
             Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Qt.rgba(161 / 255, 163 / 255, 173 / 255, 0.12) }
-            Text { anchors.left: parent.left; anchors.leftMargin: 16; anchors.verticalCenter: parent.verticalCenter; text: "shares"; color: "#bcbec8"; font.bold: true; font.family: win.font.family }
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: 16
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 10
+                Text { text: "shares"; color: "#bcbec8"; font.bold: true; font.family: win.font.family }
+                Text { text: backend.hostTitle; color: "#7e8089"; font.family: win.font.family }
+                Item {
+                    width: hostCap.width
+                    height: hostCap.height
+                    Keycap { id: hostCap; label: "H" }
+                    MouseArea { anchors.fill: parent; onClicked: win.openHosts() }
+                }
+            }
             Row {
                 anchors.right: parent.right
                 anchors.rightMargin: 14
@@ -262,7 +317,7 @@ ApplicationWindow {
                     anchors.margins: 8
                     spacing: 0
 
-                    Text { height: 32; width: parent.width; verticalAlignment: Text.AlignVCenter; leftPadding: 8; text: "ON THIS MACHINE"; color: "#7e8089"; font.bold: true; font.pixelSize: 11; font.letterSpacing: 1; font.family: win.font.family }
+                    Text { height: 32; width: parent.width; verticalAlignment: Text.AlignVCenter; leftPadding: 8; text: backend.hostTitle.toUpperCase(); color: "#7e8089"; font.bold: true; font.pixelSize: 11; font.letterSpacing: 1; font.family: win.font.family; elide: Text.ElideRight }
 
                     Repeater {
                         model: ["Samba", "NFS", "iSCSI", "S3"]
@@ -601,6 +656,7 @@ ApplicationWindow {
                     "1 2 3 4    Samba, NFS, iSCSI, S3",
                     "J K    move through the list",
                     "/    filter",
+                    "H    computers on SSH or Tailscale",
                     "N    new share, export, target, or bucket",
                     "Ctrl+O    browse again while creating",
                     "E    edit the selected row",
@@ -680,6 +736,128 @@ ApplicationWindow {
     Connections {
         target: backend
         function onCreatePathChosen(path) { win.usePickedPath(path) }
+        function onNeedsReady() { needsOpen = true }
+    }
+
+    Rectangle {
+        visible: win.hostsOpen
+        anchors.centerIn: parent
+        width: 460
+        height: Math.min(560, hostCol.implicitHeight + 36)
+        color: "#16161e"
+        border.color: "#424247"
+        Column {
+            id: hostCol
+            x: 18
+            y: 18
+            width: 424
+            spacing: 8
+            Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+            Text { width: 424; wrapMode: Text.Wrap; text: "Tailscale lists the machines on this tailnet. J and K move. Enter opens the highlighted computer. A typed host uses SSH and the key you already have."; color: "#7e8089"; font.family: win.font.family }
+            Flickable {
+                width: 424
+                height: 220
+                contentHeight: hostList.implicitHeight
+                clip: true
+                Column {
+                    id: hostList
+                    width: 424
+                    spacing: 4
+                    Repeater {
+                        model: backend.hosts
+                        delegate: Rectangle {
+                            required property var modelData
+                            required property int index
+                            width: 424
+                            height: 46
+                            color: index === win.hostCursor ? "#22222c" : "#0f0f18"
+                            border.color: index === win.hostCursor ? "#6b6d76" : "#424247"
+                            border.width: 1
+                            Column {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 8
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 1
+                                Text { width: parent.width; elide: Text.ElideRight; text: modelData.name; color: "#bcbec8"; font.family: win.font.family }
+                                Text { width: parent.width; elide: Text.ElideRight; text: modelData.detail; color: "#7e8089"; font.pixelSize: 11; font.family: win.font.family }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    win.hostCursor = index
+                                    if (backend.useHost(modelData.id))
+                                        win.hostsOpen = false
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            TextField {
+                id: hostUserField
+                width: 424
+                placeholderText: "SSH user"
+                placeholderTextColor: "#7e8089"
+                color: "#a1a3ad"
+                font.family: win.font.family
+                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+            }
+            TextField {
+                id: hostNameField
+                width: 424
+                placeholderText: "Host or Tailscale name"
+                placeholderTextColor: "#7e8089"
+                color: "#a1a3ad"
+                font.family: win.font.family
+                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+            }
+            TextField {
+                id: hostPortField
+                width: 424
+                placeholderText: "Port 22"
+                placeholderTextColor: "#7e8089"
+                color: "#a1a3ad"
+                font.family: win.font.family
+                text: "22"
+                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+            }
+            Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 424; wrapMode: Text.Wrap; font.family: win.font.family }
+            Row {
+                spacing: 8
+                ActionButton {
+                    label: "Connect"
+                    primary: true
+                    onActivated: win.connectTypedHost()
+                }
+                ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: { if (backend.trustHost()) win.hostsOpen = false } }
+                ActionButton { label: "Close"; onActivated: win.hostsOpen = false }
+            }
+        }
+    }
+
+    Rectangle {
+        visible: win.needsOpen
+        anchors.centerIn: parent
+        width: 480
+        height: needCol.implicitHeight + 36
+        color: "#16161e"
+        border.color: "#424247"
+        Column {
+            id: needCol
+            x: 18
+            y: 18
+            width: 444
+            spacing: 10
+            Text { text: "Needed on " + backend.hostTitle; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+            Text { width: 444; wrapMode: Text.Wrap; text: backend.needsText; color: "#a1a3ad"; font.family: win.font.family }
+            Row {
+                spacing: 8
+                ActionButton { label: "Install"; primary: true; visible: backend.canInstall; onActivated: { if (backend.installNeeds()) win.needsOpen = false } }
+                ActionButton { label: "Not now"; onActivated: win.needsOpen = false }
+            }
+        }
     }
 
     Rectangle {

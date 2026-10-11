@@ -35,11 +35,27 @@ struct Account {
     bool samba = false;
 };
 
+// Arch and Debian do not use the same unit or package names. The profile picks
+// the names for the computer that will actually run the commands.
+struct OsProfile {
+    QString family = QStringLiteral("arch");
+    QString sambaUnit = QStringLiteral("smb");
+    QString nfsUnit = QStringLiteral("nfs-server");
+    QString iscsiUnit = QStringLiteral("target");
+    QString sambaPackage = QStringLiteral("samba");
+    QString nfsPackage = QStringLiteral("nfs-utils");
+    QString iscsiPackage = QStringLiteral("targetcli-fb");
+};
+
 class Library {
 public:
     Library(QString root, Commands *commands);
 
     void load();
+    void setProfile(const OsProfile &profile) { m_profile = profile; }
+    void setRoot(QString root);
+    void setCommands(Commands *commands) { m_commands = commands; }
+    const OsProfile &profile() const { return m_profile; }
 
     QString notice;
     QString sambaState;
@@ -69,6 +85,7 @@ public:
 private:
     QString m_root;
     Commands *m_commands = nullptr;
+    OsProfile m_profile;
 };
 
 bool loopbackOrigin(const QString &url);

@@ -78,9 +78,10 @@ bool commandAllowed(const QStringList &args) {
         const auto verb = args.at(1);
         const auto unit = args.at(2);
         const bool verbOk = verb == "start" || verb == "reload" || verb == "restart" || verb == "is-active";
-        const bool unitOk = unit == "smb" || unit == "smb.service" || unit == "nfs-server" || unit == "nfs-server.service"
-            || unit == "target" || unit == "target.service" || unit == "minio" || unit == "garage"
-            || unit == "ceph-radosgw" || unit == "rustfs";
+        const bool unitOk = unit == "smb" || unit == "smb.service" || unit == "smbd" || unit == "smbd.service"
+            || unit == "nfs-server" || unit == "nfs-server.service" || unit == "target" || unit == "target.service"
+            || unit == "rtslib-fb-targetctl" || unit == "rtslib-fb-targetctl.service" || unit == "minio"
+            || unit == "garage" || unit == "ceph-radosgw" || unit == "rustfs";
         return verbOk && unitOk;
     }
     if (program == "smbpasswd") {

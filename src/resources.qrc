@@ -1,5 +1,6 @@
 <RCC>
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
+        <file alias="shares_apply.py">shares_apply.py</file>
     </qresource>
 </RCC>

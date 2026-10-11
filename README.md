@@ -1,6 +1,6 @@
 # Shares
 
-A keyboard-first window for publishing folders from this machine over Samba and NFS, disks over iSCSI, and buckets on a local S3 service. It follows the Omarchy theme and installs like any other Arch package.
+A keyboard-first window for publishing folders over Samba and NFS, disks over iSCSI, and buckets on a local S3 service. It can manage this computer, or another computer over SSH, including machines that are on a Tailscale network. It follows the Omarchy theme and installs like any other Arch package.
 
 The pictures use placeholder names. The installed window reads this machine at startup and does not keep those names.
 
@@ -56,9 +56,29 @@ NFS exports take one or more clients, each with its own options. iSCSI targets t
 
 S3 lists, creates, and deletes buckets for MinIO (`mc` alias `local`), Garage, and RustFS, and lists and removes empty Ceph RGW buckets. Access users and keys can be created for MinIO, Garage, and Ceph. Ceph creates a bucket through the S3 API, so this window does not. RustFS access keys are listed and not created here. Policies, groups, versioning, and object lock are not in this window.
 
-A missing tool is named in the window. Shares does not install packages for you.
+A missing tool is named in the window. On this computer, Shares does not install packages for you. On another computer, it lists what is missing and can install that list after you confirm.
 
 Names this machine is reachable as are read when the window opens. They are not stored in the program.
+
+## Other computers
+
+Press `H`, or the H in the top bar. This computer is always first. `J` and `K` move through the list, and Enter opens the highlighted computer.
+
+If Tailscale is running on this computer, Shares reads `tailscale status` and lists the peers that are online. A peer with Tailscale SSH is opened with `tailscale ssh`. Any other peer is opened with OpenSSH to its MagicDNS name, or to its Tailscale address when that name is empty. The connection uses the SSH key you already have. Shares does not store a password, and it does not ask SSH to prompt for one.
+
+A computer that is not on the tailnet can be typed as a user, a host, and a port. Those names are kept in the Shares config file, readable only by you. The first connection requires a host key you already trust. Trust key accepts that key once. Later connections check it again.
+
+The other computer does not need this window. It needs OpenSSH (`sshd`) or Tailscale SSH, `python3`, and passwordless `sudo` for the SSH user. Shares copies a small apply helper there and sends the same file plan it would write locally. The helper allows the same paths and commands, and a removal still leaves the folder, disk image, dataset, or zvol in place.
+
+When a tool is missing, the window lists it and the exact install command. Install runs only after you press Install, and only when `sudo -n` already works. If a password is required, the window shows the command and does not prompt. S3 packages are not part of that install.
+
+| | Arch | Debian, Ubuntu, Proxmox |
+|---|---|---|
+| Samba | `samba`, unit `smb` | `samba`, unit `smbd` |
+| NFS | `nfs-utils`, unit `nfs-server` | `nfs-kernel-server`, unit `nfs-server` |
+| iSCSI | `targetcli-fb`, unit `target` | `targetcli-fb`, unit `rtslib-fb-targetctl` |
+
+`python3` is included when it is missing. The helper is what applies the save, so the Shares package itself is not installed on the server.
 
 New for Samba, NFS, and iSCSI opens the system file browser. Create Folder makes the directory. The list takes the keyboard and the mouse. `Ctrl+O` opens the browser again, and the path can still be typed. That browser needs `xdg-desktop-portal`.
 
@@ -102,6 +122,7 @@ Regenerate the pictures in `docs/` with `docs/mockups/render.py`, then screensho
 | `1` `2` `3` `4` | Samba, NFS, iSCSI, S3 |
 | `J` `K` | Move through the list |
 | `/` | Filter |
+| `H` | Computers on SSH or Tailscale |
 | `N` | New share, export, target, or bucket. Opens the folder browser |
 | `Ctrl+O` | Open the folder browser again while creating |
 | `E` | Edit the selected row |

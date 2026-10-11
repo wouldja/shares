@@ -1,10 +1,15 @@
+#include <algorithm>
 #include <QClipboard>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
+#include <QProcess>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -12,6 +17,7 @@
 
 #include "backend.h"
 #include "config.h"
+#include "remote.h"
 #include "store.h"
 #include "theme.h"
 
@@ -56,6 +62,64 @@ QString readFile(const QString &path) {
 }
 
 } // namespace
+
+class ScriptedLink : public RemoteLink {
+public:
+    QHash<QString, CommandResult> exact;
+    QVector<QStringList> calls;
+    QStringList inputs;
+    bool installed = false;
+
+    CommandResult exec(const QStringList &argv, const QString &input, int) override {
+        calls.append(argv);
+        inputs.append(input);
+        const auto key = argv.join(' ');
+        if (key.contains("apt-get install") || key.contains("pacman -S"))
+            installed = true;
+        if (exact.contains(key))
+            return exact.value(key);
+        if (argv.value(0) == "test" && argv.value(1) == "-x")
+            return {installed || key == "test -x /usr/bin/python3" ? 0 : 1, {}, {}, false};
+        if (key.startsWith("sudo -n cat"))
+            return {1, {}, "cat: No such file or directory", false};
+        if (key.startsWith("sudo -n "))
+            return {0, {}, {}, false};
+        if (argv.value(0) == "hostname")
+            return {0, "pve\n", {}, false};
+        return {1, {}, {}, false};
+    }
+};
+
+struct PyRun {
+    int code = -1;
+    QString out;
+    QString err;
+};
+
+PyRun runApply(const QStringList &args, const QByteArray &input) {
+    PyRun run;
+    QProcess process;
+    process.start(QStringLiteral("python3"), QStringList{QString(SHARES_APPLY_PY)} + args);
+    if (!process.waitForStarted(5000)) {
+        run.err = process.errorString();
+        return run;
+    }
+    process.write(input);
+    process.closeWriteChannel();
+    process.waitForFinished(20000);
+    run.code = process.exitCode();
+    run.out = QString::fromUtf8(process.readAllStandardOutput());
+    run.err = QString::fromUtf8(process.readAllStandardError());
+    return run;
+}
+
+QByteArray applyPlanJson(const QString &path, const QString &body, const QJsonArray &command) {
+    QJsonArray commands;
+    if (!command.isEmpty())
+        commands.append(QJsonObject{{"args", command}, {"input", ""}});
+    const QJsonObject plan{{"files", QJsonArray{QJsonObject{{"path", path}, {"body", body}}}}, {"commands", commands}};
+    return QJsonDocument(plan).toJson(QJsonDocument::Compact);
+}
 
 class FakePicker : public FilePicker {
 public:
@@ -366,6 +430,211 @@ private slots:
         QCOMPARE(picker.files, 1);
         QCOMPARE(picker.folders, 0);
         QVERIFY(backend.error().contains("no folder"));
+    }
+
+    void tailscalePeersSkipSelfAndOffline() {
+        const auto peers = tailscalePeers(R"({
+            "Self": {"DNSName": "files.example.ts.net."},
+            "Peer": {
+                "self": {"HostName": "files", "DNSName": "files.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["100.100.100.1"], "sshHostKeys": []},
+                "pve": {"HostName": "pve", "DNSName": "pve.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["fd7a:115c:a1e0::2", "100.100.100.2"], "sshHostKeys": ["ssh-ed25519 AAAA"]},
+                "off": {"HostName": "off", "DNSName": "off.example.ts.net.", "Online": false,
+                    "TailscaleIPs": ["100.100.100.3"]},
+                "store": {"HostName": "store", "DNSName": "", "Online": true,
+                    "TailscaleIPs": ["100.100.100.4"]}
+            }
+        })");
+        QCOMPARE(peers.size(), 2);
+        QCOMPARE(peers.at(0).host, QString("pve.example.ts.net"));
+        QCOMPARE(peers.at(0).address, QString("100.100.100.2"));
+        QVERIFY(peers.at(0).tailscaleSsh);
+        QCOMPARE(peers.at(0).via, QString("tailscale"));
+        QCOMPARE(peers.at(1).host, QString("100.100.100.4"));
+        QVERIFY(!peers.at(1).tailscaleSsh);
+    }
+
+    void remoteProfileAndPackages() {
+        const auto debian = profileForRelease("debian", "debian");
+        QCOMPARE(debian.family, QString("debian"));
+        QCOMPARE(debian.sambaUnit, QString("smbd"));
+        QCOMPARE(debian.nfsPackage, QString("nfs-kernel-server"));
+        QCOMPARE(debian.iscsiUnit, QString("rtslib-fb-targetctl"));
+        const auto ubuntu = profileForRelease("ubuntu", "debian");
+        QCOMPARE(ubuntu.sambaUnit, QString("smbd"));
+        const auto arch = profileForRelease("arch", "arch");
+        QCOMPARE(arch.family, QString("arch"));
+        QCOMPARE(arch.sambaUnit, QString("smb"));
+        QCOMPARE(arch.nfsPackage, QString("nfs-utils"));
+        QCOMPARE(arch.iscsiUnit, QString("target"));
+        QCOMPARE(missingPackages(debian, false, false, false, false),
+                 QStringList({"python3", "samba", "nfs-kernel-server", "targetcli-fb"}));
+        const auto argv = installArgv(debian, {"curl", "samba", "samba"});
+        QCOMPARE(argv.size(), 2);
+        QCOMPARE(argv.first(), QStringList({"sudo", "-n", "apt-get", "update"}));
+        QVERIFY(argv.last().contains("nfs-kernel-server") == false);
+        QVERIFY(argv.last().contains("samba"));
+        QVERIFY(!argv.last().contains("curl"));
+        QCOMPARE(installArgv(arch, {"python3"}).first().first(), QString("sudo"));
+        QVERIFY(installCommand(arch, {"python3"}).contains("pacman"));
+    }
+
+    void remoteTargetRejectsUnsafeNames() {
+        QVERIFY(remoteTargetOk("ada", "files.example.net", 22));
+        QVERIFY(remoteTargetOk("ada", "pve.example.ts.net", 22));
+        QVERIFY(!remoteTargetOk("Ada", "files.example.net", 22));
+        QVERIFY(!remoteTargetOk("ada", "files example.net", 22));
+        QVERIFY(!remoteTargetOk("ada", "-files", 22));
+        QVERIFY(!remoteTargetOk("ada", "a..b", 22));
+        QVERIFY(!remoteTargetOk("ada", "files.", 22));
+        QVERIFY(!remoteTargetOk("", "files", 22));
+        QVERIFY(!remoteTargetOk("ada", "files", 0));
+        QVERIFY(!remoteTargetOk("ada", "files", 70000));
+        QVERIFY(commandAllowed({"systemctl", "start", "smbd"}));
+        QVERIFY(commandAllowed({"systemctl", "reload", "rtslib-fb-targetctl"}));
+        QVERIFY(!commandAllowed({"bash", "-c", "id"}));
+    }
+
+    void debianPlanStartsSmbd() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        Library library(dir.path(), &commands);
+        library.setProfile(profileForRelease("debian", "debian"));
+        SambaConfig config;
+        SambaShare share;
+        share.name = "photos";
+        share.path = "/srv/photos";
+        config.shares.append(share);
+        const auto plan = library.plan(config, {}, {});
+        QVERIFY(plan.error.isEmpty());
+        bool smbd = false;
+        bool smb = false;
+        for (const auto &command : plan.commands) {
+            if (command.args == QStringList{"systemctl", "start", "smbd"})
+                smbd = true;
+            if (command.args == QStringList{"systemctl", "start", "smb"})
+                smb = true;
+        }
+        QVERIFY(smbd);
+        QVERIFY(!smb);
+    }
+
+    void applyHelperWritesAndRefuses() {
+        if (QStandardPaths::findExecutable(QStringLiteral("python3")).isEmpty())
+            QSKIP("python3 is not installed");
+        QTemporaryDir dir;
+        const auto made = dir.path() + "/made";
+        const auto wrote = runApply({QStringLiteral("--root"), dir.path()},
+                                     applyPlanJson("etc/samba/shares.conf", "[photos]\n   path = /srv/photos\n",
+                                                   QJsonArray{"mkdir", "-p", made}));
+        QCOMPARE(wrote.code, 0);
+        QVERIFY(readFile(dir.path() + "/etc/samba/shares.conf").contains("[photos]"));
+        QVERIFY(QFileInfo(made).isDir());
+        const auto escaped = runApply({QStringLiteral("--root"), dir.path()},
+                                       applyPlanJson("etc/../passwd", "nope", {}));
+        QVERIFY(escaped.code != 0);
+        QVERIFY(escaped.err.contains("Refusing"));
+        QVERIFY(!QFile::exists(dir.path() + "/passwd"));
+        const auto shell = runApply({QStringLiteral("--root"), dir.path()},
+                                     applyPlanJson("etc/samba/shares.conf", "[photos]\n", QJsonArray{"echo", "hi"}));
+        QVERIFY(shell.code != 0);
+        QVERIFY(shell.err.contains("Refusing"));
+        const auto rooted = runApply({QStringLiteral("--root"), dir.path() + "/../outside"},
+                                      applyPlanJson("etc/samba/shares.conf", "[photos]\n", {}));
+        QVERIFY(rooted.code != 0);
+        QVERIFY(rooted.err.contains("absolute"));
+    }
+
+    void tailscaleHostSaveStaysOnTheLink() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json",
+                              {0,
+                               QString(R"({"Self":{"DNSName":"files.example.ts.net."},"Peer":{"pve":{"HostName":"pve","DNSName":"pve.example.ts.net.","Online":true,"TailscaleIPs":["100.100.100.2"],"sshHostKeys":["ssh-ed25519 AAAA"]},"off":{"HostName":"off","DNSName":"off.example.ts.net.","Online":false,"TailscaleIPs":["100.100.100.3"]}}})"),
+                               {},
+                               false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        const auto rows = backend.hosts();
+        QStringList names;
+        for (const auto &row : rows)
+            names << row.toMap().value("name").toString();
+        QVERIFY(names.contains("This computer"));
+        QVERIFY(names.contains("pve"));
+        QVERIFY(!names.contains("off"));
+        const auto pve = std::find_if(rows.cbegin(), rows.cend(), [](const QVariant &row) {
+            return row.toMap().value("name").toString() == "pve";
+        });
+        QVERIFY(pve != rows.cend());
+        QVERIFY(pve->toMap().value("detail").toString().contains("Tailscale SSH"));
+        QVERIFY(pve->toMap().value("detail").toString().contains("pve.example.ts.net"));
+
+        QVERIFY(backend.addHost("share", "files.example.net", 22));
+        QCOMPARE(backend.hostTitle(), QString("files"));
+        QVERIFY(backend.canInstall());
+        QVERIFY(backend.needsText().contains("nfs-kernel-server"));
+        QVERIFY(backend.needsText().contains("apt-get install"));
+        QVERIFY(!backend.needsText().contains("password"));
+        const auto saved = readFile(dir.path() + "/hosts.json");
+        QVERIFY(saved.contains("files.example.net"));
+        QVERIFY(saved.contains("share"));
+        QVERIFY(!saved.contains("password"));
+        const auto perms = QFileInfo(dir.path() + "/hosts.json").permissions();
+        QVERIFY(perms & QFileDevice::ReadOwner);
+        QVERIFY(perms & QFileDevice::WriteOwner);
+        QVERIFY(!(perms & QFileDevice::ReadGroup));
+        QVERIFY(!(perms & QFileDevice::ReadOther));
+
+        QVERIFY(backend.installNeeds());
+        QVERIFY(!backend.canInstall());
+        QVERIFY(backend.needsText().isEmpty());
+        QVERIFY(joinedCalls(link.calls).contains("apt-get install"));
+        QVERIFY(backend.create("photos", "/srv/photos"));
+        QVERIFY(!backend.useHost("local"));
+        QVERIFY(backend.error().contains("Save or discard"));
+        QVERIFY(backend.save());
+        int apply = -1;
+        for (int i = 0; i < link.calls.size(); ++i) {
+            if (link.calls.at(i).join(' ').contains("apply.py"))
+                apply = i;
+        }
+        QVERIFY(apply >= 0);
+        QVERIFY(link.inputs.at(apply).contains("[photos]"));
+        QVERIFY(link.inputs.at(apply).contains("\"systemctl\",\"start\",\"smbd\""));
+        QVERIFY(!QFile::exists(dir.path() + "/etc/samba/shares.conf"));
+        QVERIFY(!joinedCalls(commands.calls).contains("targetcli saveconfig"));
+        QVERIFY(!joinedCalls(commands.calls).contains("pkexec"));
+        QVERIFY(backend.useHost("local"));
+        QCOMPARE(backend.hostTitle(), QString("This computer"));
+    }
+
+    void remoteInstallWaitsForSudoAndATrustedKey() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {1, {}, "sudo: a password is required\n", false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        QVERIFY(backend.addHost("share", "files.example.net", 22));
+        QVERIFY(!backend.canInstall());
+        QVERIFY(backend.needsText().contains("passwordless sudo"));
+        QVERIFY(backend.needsText().contains("apt-get install"));
+        QVERIFY(backend.error().contains("passwordless sudo"));
+        QVERIFY(!backend.installNeeds());
+        QVERIFY(!joinedCalls(link.calls).contains("apt-get"));
+
+        ScriptedLink denied;
+        denied.exact.insert("cat /etc/os-release", {1, {}, "Host key verification failed.\n", false});
+        Backend other(dir.path(), &commands, nullptr, &denied);
+        QVERIFY(!other.addHost("share", "pve.example.ts.net", 22));
+        QVERIFY(other.canTrustHost());
+        QVERIFY(other.error().contains("host key"));
+        QVERIFY(!other.trustHost());
+        QVERIFY(!joinedCalls(denied.calls).contains("StrictHostKeyChecking"));
     }
 
     void themeFallsBack() {

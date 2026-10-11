@@ -1,15 +1,19 @@
 #include "backend.h"
 
 #include "portalfilepicker.h"
+#include "remote.h"
 
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDate>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSaveFile>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QStandardPaths>
@@ -191,22 +195,48 @@ QString imageName(const QString &currentPath, const QString &currentName) {
 
 } // namespace
 
-Backend::Backend(const QString &root, Commands *commands, FilePicker *picker, QObject *parent)
+Backend::Backend(const QString &root, Commands *commands, FilePicker *picker, RemoteLink *link, QObject *parent)
     : QObject(parent), m_owned(commands ? nullptr : std::make_unique<Commands>()),
-      m_commands(commands ? commands : m_owned.get()), m_root(cleanRoot(root)), m_library(m_root, m_commands),
+      m_localCommands(commands ? commands : m_owned.get()), m_commands(m_localCommands), m_link(link),
+      m_injectedLink(link), m_appRoot(cleanRoot(root)), m_root(m_appRoot), m_library(m_root, m_commands),
       m_picker(picker) {
     if (m_picker)
         connectPicker();
+    if (m_appRoot == "/") {
+        QFile release("/etc/os-release");
+        QString id;
+        QString like;
+        if (release.open(QIODevice::ReadOnly)) {
+            const auto text = QString::fromUtf8(release.readAll());
+            for (const auto &line : text.split('\n')) {
+                if (line.startsWith("ID="))
+                    id = line.mid(3).trimmed().remove('"');
+                if (line.startsWith("ID_LIKE="))
+                    like = line.mid(8).trimmed().remove('"');
+            }
+        }
+        m_localProfile = profileForRelease(id, like);
+    }
+    m_library.setProfile(m_localProfile);
+    loadSavedHosts();
     reload();
 }
 
 void Backend::reload() {
+    QString pullError;
+    if (m_mirror && m_link) {
+        if (!pullRemoteFiles(m_link, m_mirror->path(), &pullError)) {
+            // Keep going with whatever was copied so the window still opens.
+        }
+        m_library.setRoot(m_mirror->path());
+        m_root = m_mirror->path();
+    }
     m_library.load();
     copyFromLibrary();
     m_filter.clear();
     m_undo.clear();
     m_redo.clear();
-    setError({});
+    setError(pullError);
     emit protocolChanged();
     emit dirtyChanged();
     emit historyChanged();
@@ -232,6 +262,7 @@ void Backend::copyFromLibrary() {
     m_dirty = m_library.smbHadShares;
     m_lastOutput.clear();
     assignIds();
+    refreshHosts();
 }
 
 void Backend::assignIds() {
@@ -1458,6 +1489,23 @@ bool Backend::runPlan(const Plan &plan, QString *output) {
         setError(plan.error);
         return false;
     }
+    if (m_mirror && m_link) {
+        QFile helper(QStringLiteral(":/shares_apply.py"));
+        if (!helper.open(QIODevice::ReadOnly)) {
+            setError(QStringLiteral("The apply helper is missing from the app."));
+            return false;
+        }
+        QString error;
+        if (!applyRemotePlan(m_link, helper.readAll(), planToJson(plan), &error, output)) {
+            setError(error.isEmpty() ? QStringLiteral("The change was not applied.") : error);
+            return false;
+        }
+        // Keep the local mirror in step with what the remote computer stored,
+        // without running the remote commands a second time on this machine.
+        applyPlan(m_mirror->path(), plan, nullptr, &error);
+        setError({});
+        return true;
+    }
     QString error;
     const bool ok = m_root == "/" ? commitWithPkexec(plan, &error, output) : applyPlan(m_root, plan, m_commands, &error, output);
     if (!ok)
@@ -1515,4 +1563,282 @@ void Backend::setError(const QString &error) {
         return;
     m_error = error;
     emit errorChanged();
+}
+
+QString Backend::localUser() const {
+    const auto user = qEnvironmentVariable("USER");
+    return accountNameOk(user) ? user : QStringLiteral("root");
+}
+
+QString Backend::hostsPath() const {
+    if (!m_hostsFile.isEmpty())
+        return m_hostsFile;
+    if (m_appRoot != "/")
+        return {};
+    const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    return dir.isEmpty() ? QString() : dir + QStringLiteral("/hosts.json");
+}
+
+void Backend::loadSavedHosts() {
+    m_saved.clear();
+    const auto path = hostsPath();
+    if (path.isEmpty())
+        return;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const auto list = QJsonDocument::fromJson(file.readAll()).object().value("hosts").toArray();
+    for (const auto &value : list) {
+        const auto obj = value.toObject();
+        RemoteHost host;
+        host.name = obj.value("name").toString();
+        host.user = obj.value("user").toString();
+        host.host = obj.value("host").toString();
+        host.port = obj.value("port").toInt(22);
+        host.via = obj.value("via").toString();
+        host.tailscaleSsh = obj.value("tailscaleSsh").toBool();
+        if (host.name.isEmpty())
+            host.name = host.host;
+        if (remoteTargetOk(host.user, host.host, host.port))
+            m_saved.append(host);
+    }
+}
+
+void Backend::writeSavedHosts() const {
+    const auto path = hostsPath();
+    if (path.isEmpty())
+        return;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QJsonArray list;
+    for (const auto &host : m_saved) {
+        list.append(QJsonObject{{"name", host.name},
+                                {"user", host.user},
+                                {"host", host.host},
+                                {"port", host.port},
+                                {"via", host.via},
+                                {"tailscaleSsh", host.tailscaleSsh}});
+    }
+    QSaveFile out(path);
+    if (!out.open(QIODevice::WriteOnly))
+        return;
+    out.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    out.write(QJsonDocument(QJsonObject{{"hosts", list}}).toJson());
+    out.commit();
+}
+
+void Backend::publishHosts() {
+    m_hostRows.clear();
+    m_hostRows << QVariantMap{{"id", "local"},
+                              {"name", "This computer"},
+                              {"detail", "the computer running this window"},
+                              {"via", ""}};
+    for (const auto &peer : m_peers) {
+        auto detail = peer.host;
+        detail += peer.tailscaleSsh ? QStringLiteral(" · Tailscale SSH") : QStringLiteral(" · tailscale");
+        m_hostRows << QVariantMap{{"id", "ts:" + peer.host}, {"name", peer.name}, {"detail", detail}, {"via", "tailscale"}};
+    }
+    for (const auto &saved : m_saved) {
+        m_hostRows << QVariantMap{{"id", "saved:" + saved.user + "@" + saved.host + ":" + QString::number(saved.port)},
+                                  {"name", saved.name},
+                                  {"detail", saved.user + "@" + saved.host},
+                                  {"via", saved.via}};
+    }
+    emit hostChanged();
+}
+
+void Backend::refreshHosts() {
+    const auto status = m_localCommands->run("tailscale", {"status", "--json"});
+    m_peers = !status.missing && status.code == 0 ? tailscalePeers(status.out) : QVector<RemoteHost>{};
+    publishHosts();
+}
+
+RemoteHost Backend::hostById(const QString &id) const {
+    if (id.startsWith("ts:")) {
+        const auto name = id.mid(3);
+        for (const auto &peer : m_peers) {
+            if (peer.host == name)
+                return peer;
+        }
+    }
+    if (id.startsWith("saved:")) {
+        const auto rest = id.mid(6);
+        for (const auto &saved : m_saved) {
+            if (rest == saved.user + "@" + saved.host + ":" + QString::number(saved.port))
+                return saved;
+        }
+    }
+    return {};
+}
+
+void Backend::useLocal() {
+    m_mirror.reset();
+    m_remoteCommands.reset();
+    m_ownedLink.reset();
+    m_link = m_injectedLink;
+    m_commands = m_localCommands;
+    m_library.setCommands(m_commands);
+    m_library.setRoot(m_appRoot);
+    m_library.setProfile(m_localProfile);
+    m_root = m_appRoot;
+    m_hostTitle = QStringLiteral("This computer");
+    m_needsText.clear();
+    m_neededPackages.clear();
+    m_canInstall = false;
+    m_canTrustHost = false;
+    publishHosts();
+}
+
+bool Backend::connectRemote(const RemoteHost &host) {
+    auto target = host;
+    if (target.user.isEmpty())
+        target.user = localUser();
+    if (!m_injectedLink) {
+        if (!remoteTargetOk(target.user, target.host, target.port)) {
+            setError(QStringLiteral("That computer needs a user and a plain host name."));
+            return false;
+        }
+        m_ownedLink = std::make_unique<SshLink>(target.user, target.host, target.port, target.tailscaleSsh);
+        m_link = m_ownedLink.get();
+    }
+    m_pendingUser = target.user;
+    m_pendingHost = target.host;
+    m_pendingPort = target.port;
+    m_pendingTailscaleSsh = target.tailscaleSsh;
+    const auto need = probeRemote(m_link);
+    if (!need.connected) {
+        m_canTrustHost = need.hostKeyDenied;
+        m_canInstall = false;
+        m_needsText.clear();
+        setError(need.error);
+        emit hostChanged();
+        return false;
+    }
+    m_mirror = std::make_unique<QTemporaryDir>();
+    if (!m_mirror->isValid()) {
+        setError(QStringLiteral("Could not keep a local copy of that computer."));
+        return false;
+    }
+    m_remoteCommands = std::make_unique<RemoteCommands>(m_link);
+    m_commands = m_remoteCommands.get();
+    m_library.setCommands(m_commands);
+    m_library.setProfile(need.profile);
+    m_remoteProfile = need.profile;
+    m_hostTitle = target.name.isEmpty() ? target.host : target.name;
+    m_neededPackages = need.packages;
+    m_canInstall = need.sudo && !need.packages.isEmpty();
+    m_canTrustHost = false;
+    if (!need.sudo)
+        m_needsText = need.error + QStringLiteral("\n\n") + need.command;
+    else if (!need.packages.isEmpty())
+        m_needsText = QStringLiteral("These packages are missing on %1:\n").arg(m_hostTitle) + need.command;
+    else
+        m_needsText.clear();
+    reload();
+    if (!need.sudo)
+        setError(need.error);
+    if (!m_needsText.isEmpty())
+        emit needsReady();
+    return true;
+}
+
+bool Backend::useHost(const QString &id) {
+    if (m_dirty) {
+        setError(QStringLiteral("Save or discard changes before switching computers."));
+        return false;
+    }
+    if (id.isEmpty() || id == "local") {
+        useLocal();
+        reload();
+        return true;
+    }
+    const auto host = hostById(id);
+    if (host.host.isEmpty()) {
+        setError(QStringLiteral("That computer is not in the list."));
+        return false;
+    }
+    return connectRemote(host);
+}
+
+bool Backend::addHost(const QString &user, const QString &hostName, int port) {
+    const auto userName = user.trimmed().isEmpty() ? localUser() : user.trimmed();
+    const auto host = hostName.trimmed();
+    const int actualPort = port == 0 ? 22 : port;
+    if (!remoteTargetOk(userName, host, actualPort)) {
+        setError(QStringLiteral("Use a plain user, host, and port. Shares keeps the SSH key you already have."));
+        return false;
+    }
+    if (m_dirty) {
+        setError(QStringLiteral("Save or discard changes before switching computers."));
+        return false;
+    }
+    RemoteHost remote;
+    remote.name = host.section('.', 0, 0);
+    remote.user = userName;
+    remote.host = host;
+    remote.port = actualPort;
+    remote.via = "ssh";
+    bool replaced = false;
+    for (auto &saved : m_saved) {
+        if (saved.user == remote.user && saved.host == remote.host && saved.port == remote.port) {
+            saved = remote;
+            replaced = true;
+        }
+    }
+    if (!replaced)
+        m_saved.append(remote);
+    writeSavedHosts();
+    publishHosts();
+    return connectRemote(remote);
+}
+
+bool Backend::installNeeds() {
+    if (m_dirty) {
+        setError(QStringLiteral("Save or discard changes before installing packages."));
+        return false;
+    }
+    if (!m_link || !m_canInstall || m_neededPackages.isEmpty()) {
+        setError(QStringLiteral("There is nothing to install, or that computer still needs a sudo password."));
+        return false;
+    }
+    QString error;
+    if (!installRemotePackages(m_link, m_remoteProfile, m_neededPackages, &error)) {
+        setError(error);
+        return false;
+    }
+    const auto need = probeRemote(m_link);
+    m_remoteProfile = need.profile;
+    m_library.setProfile(need.profile);
+    m_neededPackages = need.packages;
+    m_canInstall = need.connected && need.sudo && !need.packages.isEmpty();
+    if (!need.connected)
+        m_needsText = need.error;
+    else if (!need.sudo)
+        m_needsText = need.error + QStringLiteral("\n\n") + need.command;
+    else if (!need.packages.isEmpty())
+        m_needsText = QStringLiteral("These packages are missing on %1:\n").arg(m_hostTitle) + need.command;
+    else
+        m_needsText.clear();
+    reload();
+    if (!need.connected || !need.sudo)
+        setError(need.error);
+    else
+        setError({});
+    if (!m_needsText.isEmpty())
+        emit needsReady();
+    emit hostChanged();
+    return need.connected && need.sudo && need.packages.isEmpty();
+}
+
+bool Backend::trustHost() {
+    if (!m_canTrustHost)
+        return false;
+    if (auto *ssh = dynamic_cast<SshLink *>(m_ownedLink.get()))
+        ssh->trustNextKey();
+    RemoteHost host;
+    host.user = m_pendingUser;
+    host.host = m_pendingHost;
+    host.port = m_pendingPort;
+    host.tailscaleSsh = m_pendingTailscaleSsh;
+    host.name = m_pendingHost.section('.', 0, 0);
+    return connectRemote(host);
 }

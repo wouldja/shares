@@ -74,8 +74,13 @@ CommandResult Commands::run(const QString &program, const QStringList &args, con
 }
 
 Library::Library(QString root, Commands *commands) : m_root(std::move(root)), m_commands(commands) {
-    if (m_root.endsWith('/') && m_root.size() > 1)
-        m_root.chop(1);
+    setRoot(m_root);
+}
+
+void Library::setRoot(QString root) {
+    if (root.endsWith('/') && root.size() > 1)
+        root.chop(1);
+    m_root = root;
 }
 
 void Library::load() {
@@ -111,9 +116,9 @@ void Library::load() {
     bool iscsiOk = false;
     iscsi = parseIscsiJson(readFile(m_root + "/etc/shares/iscsi.json").toUtf8(), &iscsiOk);
 
-    sambaState = serviceState(m_commands, "smb", "samba");
-    nfsState = serviceState(m_commands, "nfs-server", "nfs-utils");
-    iscsiState = serviceState(m_commands, "target", "targetcli-fb");
+    sambaState = serviceState(m_commands, m_profile.sambaUnit, m_profile.sambaPackage);
+    nfsState = serviceState(m_commands, m_profile.nfsUnit, m_profile.nfsPackage);
+    iscsiState = serviceState(m_commands, m_profile.iscsiUnit, m_profile.iscsiPackage);
     if (m_commands->run("gwcli", {"--version"}).missing && m_commands->run("rbd", {"--version"}).missing)
         iscsiState += iscsi.clustered ? " · clustered tools are not installed" : "";
     else if (iscsi.clustered)
@@ -341,16 +346,16 @@ Plan Library::plan(const SambaConfig &nextSamba, const QVector<NfsExport> &nextN
     const bool iscsiWork = !nextIscsi.targets.isEmpty() || !nextIscsi.devices.isEmpty() || !iscsi.targets.isEmpty()
         || !iscsi.devices.isEmpty();
     if (sambaWork) {
-        plan.commands.append({{"systemctl", "start", "smb"}, {}});
-        plan.commands.append({{"systemctl", "reload", "smb"}, {}});
+        plan.commands.append({{"systemctl", "start", m_profile.sambaUnit}, {}});
+        plan.commands.append({{"systemctl", "reload", m_profile.sambaUnit}, {}});
     }
     if (nfsWork) {
-        plan.commands.append({{"systemctl", "start", "nfs-server"}, {}});
+        plan.commands.append({{"systemctl", "start", m_profile.nfsUnit}, {}});
         plan.commands.append({{"exportfs", "-ra"}, {}});
     }
     if (iscsiWork && !nextIscsi.clustered) {
-        plan.commands.append({{"systemctl", "start", "target"}, {}});
-        plan.commands.append({{"systemctl", "reload", "target"}, {}});
+        plan.commands.append({{"systemctl", "start", m_profile.iscsiUnit}, {}});
+        plan.commands.append({{"systemctl", "reload", m_profile.iscsiUnit}, {}});
     }
     return plan;
 }
