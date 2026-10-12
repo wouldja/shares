@@ -368,6 +368,42 @@ private slots:
         QVERIFY(readFile(dir.path() + "/etc/samba/smb.conf").contains("workgroup = FILES"));
     }
 
+    void saveKeepsHomesAndIgnoresExportComments() {
+        QTemporaryDir dir;
+        QVERIFY(writeFile(dir.path() + "/etc/samba/smb.conf",
+                          "[global]\n   workgroup = FILES\n\n[homes]\n   comment = Home Directories\n"
+                          "   browseable = no\n\n[photos]\n   path = /srv/photos\n"));
+        QVERIFY(writeFile(dir.path() + "/etc/exports",
+                          "# /etc/exports: the access control list for filesystems which may be exported\n"
+                          "#\tto NFS clients.  See exports(5).\n"
+                          "# /srv/homes       hostname1(rw,sync,no_subtree_check)\n"
+                          "/srv/photos *(rw,sync,no_subtree_check)\n"));
+        FakeCommands commands;
+        Backend backend(dir.path(), &commands);
+        QCOMPARE(backend.rows().size(), 1);
+        QCOMPARE(backend.rows().first().toMap().value("name").toString(), QString("photos"));
+        QVERIFY(backend.dirty());
+        backend.setProtocol(1);
+        QCOMPARE(backend.rows().size(), 2);
+        QStringList paths;
+        for (const auto &row : backend.rows())
+            paths << row.toMap().value("path").toString();
+        QVERIFY(paths.contains("/srv/photos"));
+        QVERIFY(paths.contains("/srv/homes"));
+        QVERIFY(!paths.contains("to"));
+        backend.setProtocol(0);
+        QVERIFY(backend.save());
+        QVERIFY(!backend.error().contains("absolute"));
+        const auto smb = readFile(dir.path() + "/etc/samba/smb.conf");
+        QVERIFY(smb.contains("[homes]"));
+        QVERIFY(!smb.contains("[photos]"));
+        QVERIFY(readFile(dir.path() + "/etc/samba/shares.conf").contains("path = /srv/photos"));
+        Backend again(dir.path(), &commands);
+        QCOMPARE(again.rows().size(), 1);
+        QCOMPARE(again.rows().first().toMap().value("name").toString(), QString("photos"));
+        QVERIFY(!again.dirty());
+    }
+
     void iscsiSaveKeepsTheImage() {
         QTemporaryDir dir;
         FakeCommands commands;

@@ -361,18 +361,45 @@ QString ensureSambaInclude(const QString &smbConf) {
 }
 
 QString stripSambaShares(const QString &smbConf) {
+    // A section with a real folder moves to shares.conf. [homes] on Debian
+    // has no path, and that section stays here instead of failing the save.
     QString out;
-    bool skipping = false;
+    QString buffered;
+    QString sectionPath;
+    bool buffering = false;
+    auto flush = [&]() {
+        if (!buffering)
+            return;
+        if (!absolutePathOk(sectionPath))
+            out += buffered;
+        buffered.clear();
+        sectionPath.clear();
+        buffering = false;
+    };
     for (const auto &line : smbConf.split('\n')) {
         const auto trimmed = line.trimmed();
         if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-            skipping = trimmed.compare("[global]", Qt::CaseInsensitive) != 0;
-            if (skipping)
+            flush();
+            if (trimmed.compare("[global]", Qt::CaseInsensitive) == 0) {
+                out += line + "\n";
                 continue;
+            }
+            buffering = true;
+            buffered = line + "\n";
+            continue;
         }
-        if (!skipping)
-            out += line + "\n";
+        if (buffering) {
+            buffered += line + "\n";
+            if (trimmed.isEmpty() || trimmed.startsWith('#') || trimmed.startsWith(';'))
+                continue;
+            const auto eq = trimmed.indexOf('=');
+            if (eq > 0 && trimmed.left(eq).trimmed().compare("path", Qt::CaseInsensitive) == 0)
+                sectionPath = trimmed.mid(eq + 1).trimmed();
+            continue;
+        }
+        out += line + "\n";
     }
+    flush();
     return ensureSambaInclude(out);
 }
 
@@ -422,6 +449,10 @@ QVector<NfsExport> parseNfs(const QString &text) {
             path = trimmed.left(space);
             rest = trimmed.mid(space).trimmed();
         }
+        // A prose comment such as "to NFS clients. See exports(5)." is not an
+        // export. A disabled export still has a folder path.
+        if (!absolutePathOk(path))
+            continue;
         NfsExport exp;
         exp.path = path;
         exp.enabled = enabled;

@@ -149,11 +149,25 @@ void Library::loadFiles() {
     else if (!fromSmb.global.workgroup.isEmpty())
         samba.global = fromSmb.global;
     samba.includeRegistry = fromSmb.includeRegistry;
+    // [homes] on Debian has no folder. It stays in smb.conf and is not a row,
+    // so Save is not asked to invent a path for it.
+    auto withFolder = [](const QVector<SambaShare> &shares) {
+        QVector<SambaShare> kept;
+        for (const auto &share : shares) {
+            if (absolutePathOk(share.path))
+                kept.append(share);
+        }
+        return kept;
+    };
     if (!fromShares.shares.isEmpty())
-        samba.shares = fromShares.shares;
+        samba.shares = withFolder(fromShares.shares);
     else
-        samba.shares = fromSmb.shares;
-    smbHadShares = !fromSmb.shares.isEmpty();
+        samba.shares = withFolder(fromSmb.shares);
+    smbHadShares = false;
+    for (const auto &share : fromSmb.shares) {
+        if (absolutePathOk(share.path))
+            smbHadShares = true;
+    }
     if (!fromShares.shares.isEmpty() && smbHadShares)
         notice = "Samba shares are in both smb.conf and shares.conf. Save keeps the shares.conf copy and backs up smb.conf.";
     else if (smbHadShares)
