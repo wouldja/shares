@@ -1972,15 +1972,24 @@ QString Backend::hostsPath() const {
     return dir.isEmpty() ? QString() : dir + QStringLiteral("/hosts.json");
 }
 
+void Backend::setHostsFile(const QString &path) {
+    m_hostsFile = path;
+    loadSavedHosts();
+    publishHosts();
+}
+
 void Backend::loadSavedHosts() {
     m_saved.clear();
+    m_loginUsers.clear();
+    m_loginPasswords.clear();
     const auto path = hostsPath();
     if (path.isEmpty())
         return;
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return;
-    const auto list = QJsonDocument::fromJson(file.readAll()).object().value("hosts").toArray();
+    const auto root = QJsonDocument::fromJson(file.readAll()).object();
+    const auto list = root.value("hosts").toArray();
     for (const auto &value : list) {
         const auto obj = value.toObject();
         RemoteHost host;
@@ -1994,6 +2003,16 @@ void Backend::loadSavedHosts() {
             host.name = host.host;
         if (remoteTargetOk(host.user, host.host, host.port))
             m_saved.append(host);
+    }
+    for (const auto &value : root.value("logins").toArray()) {
+        const auto obj = value.toObject();
+        const auto id = obj.value("id").toString();
+        const auto user = obj.value("user").toString();
+        if (!id.startsWith(QStringLiteral("ts:")))
+            continue;
+        if (!remoteTargetOk(QStringLiteral("peer"), id.mid(3), 22) || !accountNameOk(user))
+            continue;
+        m_loginUsers.insert(id, user);
     }
 }
 
@@ -2011,11 +2030,19 @@ void Backend::writeSavedHosts() const {
                                 {"via", host.via},
                                 {"tailscaleSsh", host.tailscaleSsh}});
     }
+    QJsonArray logins;
+    for (auto it = m_loginUsers.cbegin(); it != m_loginUsers.cend(); ++it) {
+        if (!it.key().startsWith(QStringLiteral("ts:")) || !accountNameOk(it.value()))
+            continue;
+        if (!remoteTargetOk(QStringLiteral("peer"), it.key().mid(3), 22))
+            continue;
+        logins.append(QJsonObject{{"id", it.key()}, {"user", it.value()}});
+    }
     QSaveFile out(path);
     if (!out.open(QIODevice::WriteOnly))
         return;
     out.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-    out.write(QJsonDocument(QJsonObject{{"hosts", list}}).toJson());
+    out.write(QJsonDocument(QJsonObject{{"hosts", list}, {"logins", logins}}).toJson());
     out.commit();
 }
 
@@ -2024,18 +2051,30 @@ void Backend::publishHosts() {
     m_hostRows << QVariantMap{{"id", "local"},
                               {"name", "This computer"},
                               {"detail", "the computer running this window"},
-                              {"via", ""}};
+                              {"via", ""},
+                              {"user", ""},
+                              {"password", ""}};
     for (const auto &peer : m_peers) {
+        const auto id = QStringLiteral("ts:") + peer.host;
+        const auto storedUser = m_loginUsers.value(id);
+        const auto shown = storedUser.isEmpty() ? localUser() : storedUser;
         auto detail = peer.host;
-        detail += QStringLiteral(" · ") + (peer.user.isEmpty() ? localUser() : peer.user);
+        detail += QStringLiteral(" · ") + shown;
         detail += peer.tailscaleSsh ? QStringLiteral(" · Tailscale SSH") : QStringLiteral(" · tailscale");
-        m_hostRows << QVariantMap{{"id", "ts:" + peer.host}, {"name", peer.name}, {"detail", detail}, {"via", "tailscale"}};
+        m_hostRows << QVariantMap{{"id", id},
+                                  {"name", peer.name},
+                                  {"detail", detail},
+                                  {"via", "tailscale"},
+                                  {"user", shown},
+                                  {"password", m_loginPasswords.value(id)}};
     }
     for (const auto &saved : m_saved) {
         m_hostRows << QVariantMap{{"id", "saved:" + saved.user + "@" + saved.host + ":" + QString::number(saved.port)},
                                   {"name", saved.name},
                                   {"detail", saved.user + "@" + saved.host},
-                                  {"via", saved.via}};
+                                  {"via", saved.via},
+                                  {"user", saved.user},
+                                  {"password", ""}};
     }
     emit hostChanged();
 }
@@ -2105,6 +2144,7 @@ bool Backend::beginConnect(const RemoteHost &host) {
     m_trustNextConnect = false;
     m_pendingUser = target.user;
     m_pendingHost = target.host;
+    m_pendingPassword = target.password;
     m_pendingPort = target.port;
     m_pendingTailscaleSsh = target.tailscaleSsh;
     const auto label = target.name.isEmpty() ? target.host : target.name;
@@ -2119,7 +2159,8 @@ bool Backend::beginConnect(const RemoteHost &host) {
     QPointer<Backend> self(this);
     QThreadPool::globalInstance()->start([target, login, wave, trustNext, self] {
         auto attempt = [trustNext](RemoteHost candidate) {
-            auto link = std::make_shared<SshLink>(candidate.user, candidate.host, candidate.port, candidate.tailscaleSsh);
+            auto link = std::make_shared<SshLink>(candidate.user, candidate.host, candidate.port, candidate.tailscaleSsh,
+                                                  candidate.password);
             if (trustNext)
                 link->trustNextKey();
             return std::pair<std::shared_ptr<RemoteLink>, RemoteNeed>(link, probeRemote(link.get()));
@@ -2127,8 +2168,9 @@ bool Backend::beginConnect(const RemoteHost &host) {
         auto tried = attempt(target);
         auto chosen = target;
         const auto denied = QStringLiteral("does not permit you to SSH as user");
-        if (!tried.second.connected && tried.second.error.contains(denied) && chosen.user == login
-            && chosen.user != QStringLiteral("root")) {
+        // A typed password belongs to that user. Do not retry it as root.
+        if (!tried.second.connected && tried.second.error.contains(denied) && chosen.password.isEmpty()
+            && chosen.user == login && chosen.user != QStringLiteral("root")) {
             auto root = chosen;
             root.user = QStringLiteral("root");
             const auto firstError = tried.second.error;
@@ -2175,6 +2217,7 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
         return;
     m_pendingUser = result.host.user;
     m_pendingHost = result.host.host;
+    m_pendingPassword = result.host.password;
     m_pendingPort = result.host.port;
     m_pendingTailscaleSsh = result.host.tailscaleSsh;
     m_connecting = false;
@@ -2292,6 +2335,7 @@ void Backend::useLocal() {
     m_library.setProfile(m_localProfile);
     m_root = m_appRoot;
     m_hostTitle = QStringLiteral("This computer");
+    m_pendingPassword.clear();
     m_needsText.clear();
     m_neededPackages.clear();
     m_canInstall = false;
@@ -2310,8 +2354,8 @@ bool Backend::connectRemote(const RemoteHost &host) {
     // A tailnet often allows root and rejects the login running this window.
     // Retry that once. A user typed in the box is left as they wrote it.
     const auto denied = m_error;
-    if (denied.contains(QStringLiteral("does not permit you to SSH as user")) && target.user == localUser()
-        && target.user != QStringLiteral("root")) {
+    if (target.password.isEmpty() && denied.contains(QStringLiteral("does not permit you to SSH as user"))
+        && target.user == localUser() && target.user != QStringLiteral("root")) {
         target.user = QStringLiteral("root");
         if (connectRemoteUser(target))
             return true;
@@ -2331,7 +2375,7 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
             setError(QStringLiteral("That computer needs a user and a plain host name."));
             return false;
         }
-        m_linkShared = std::make_shared<SshLink>(target.user, target.host, target.port, target.tailscaleSsh);
+        m_linkShared = std::make_shared<SshLink>(target.user, target.host, target.port, target.tailscaleSsh, target.password);
         m_link = m_linkShared.get();
         if (m_trustNextConnect) {
             static_cast<SshLink *>(m_link)->trustNextKey();
@@ -2340,6 +2384,7 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     }
     m_pendingUser = target.user;
     m_pendingHost = target.host;
+    m_pendingPassword = target.password;
     m_pendingPort = target.port;
     m_pendingTailscaleSsh = target.tailscaleSsh;
     const auto need = probeRemote(m_link);
@@ -2380,7 +2425,7 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     return true;
 }
 
-bool Backend::useHost(const QString &id, const QString &user) {
+bool Backend::useHost(const QString &id, const QString &user, const QString &password) {
     // Shares found in smb.conf mark the window unsaved as soon as it connects.
     // Leaving writes nothing, so that flag cannot trap the window on that
     // computer. An edit still has an undo entry, and that still waits.
@@ -2399,15 +2444,56 @@ bool Backend::useHost(const QString &id, const QString &user) {
         setError(QStringLiteral("That computer is not in the list."));
         return false;
     }
-    const auto chosen = user.trimmed();
-    if (!chosen.isEmpty()) {
-        if (!accountNameOk(chosen)) {
-            setError(QStringLiteral("The SSH user has to be a lowercase account name."));
-            return false;
+    if (id.startsWith(QStringLiteral("ts:"))) {
+        const auto storedUser = m_loginUsers.value(id);
+        const auto chosen = user.trimmed().isEmpty() ? storedUser : user.trimmed();
+        if (!chosen.isEmpty()) {
+            if (!accountNameOk(chosen)) {
+                setError(QStringLiteral("The SSH user has to be a lowercase account name."));
+                return false;
+            }
+            host.user = chosen;
         }
-        host.user = chosen;
+        host.password = password.isEmpty() ? m_loginPasswords.value(id) : password;
+    } else {
+        const auto chosen = user.trimmed();
+        if (!chosen.isEmpty()) {
+            if (!accountNameOk(chosen)) {
+                setError(QStringLiteral("The SSH user has to be a lowercase account name."));
+                return false;
+            }
+            host.user = chosen;
+        }
+        if (!password.isEmpty())
+            host.password = password;
     }
+    if (host.password.contains(u'\n') || host.password.contains(u'\r')) {
+        setError(QStringLiteral("The SSH password cannot contain a line break."));
+        return false;
+    }
+    // Tailscale SSH authenticates the tailnet identity, not this password.
+    if (!host.password.isEmpty())
+        host.tailscaleSsh = false;
     return connectRemote(host);
+}
+
+void Backend::setHostLogin(const QString &id, const QString &user, const QString &password) {
+    if (!id.startsWith(QStringLiteral("ts:")))
+        return;
+    if (password.contains(u'\n') || password.contains(u'\r'))
+        return;
+    const auto trimmed = user.trimmed();
+    const auto previous = m_loginUsers.value(id);
+    if (trimmed.isEmpty())
+        m_loginUsers.remove(id);
+    else if (accountNameOk(trimmed))
+        m_loginUsers.insert(id, trimmed);
+    if (password.isEmpty())
+        m_loginPasswords.remove(id);
+    else
+        m_loginPasswords.insert(id, password);
+    if (m_loginUsers.value(id) != previous)
+        writeSavedHosts();
 }
 
 bool Backend::addHost(const QString &user, const QString &hostName, int port) {
@@ -2503,6 +2589,7 @@ bool Backend::trustHost() {
     host.user = m_pendingUser;
     host.host = m_pendingHost;
     host.port = m_pendingPort;
+    host.password = m_pendingPassword;
     host.tailscaleSsh = m_pendingTailscaleSsh;
     host.name = m_pendingHost.section('.', 0, 0);
     return connectRemote(host);

@@ -7,7 +7,8 @@
 #include <QVector>
 
 // One computer Shares can manage. Tailscale peers use the tailnet name so the
-// SSH connection stays on the tailnet. No password is stored.
+// SSH connection stays on the tailnet. A password is held for that connection
+// only. It is not written to the host file.
 struct RemoteHost {
     QString name;
     QString user;
@@ -15,6 +16,7 @@ struct RemoteHost {
     int port = 22;
     QString via;
     QString address;
+    QString password;
     bool tailscaleSsh = false;
 };
 
@@ -38,7 +40,7 @@ public:
 
 class SshLink : public RemoteLink {
 public:
-    SshLink(QString user, QString host, int port, bool tailscaleSsh);
+    SshLink(QString user, QString host, int port, bool tailscaleSsh, QString password = {});
 
     CommandResult exec(const QStringList &argv, const QString &input, int timeoutMs) override;
     void trustNextKey();
@@ -47,6 +49,7 @@ private:
     QString controlSocket();
 
     QString m_target;
+    QString m_password;
     int m_port = 22;
     bool m_tailscaleSsh = false;
     bool m_trustNext = false;
@@ -57,8 +60,14 @@ private:
 
 // Client argv up to, but not including, the remote command. An empty control
 // path, a Tailscale SSH destination, or a too-long socket skips multiplexing.
+// withPassword uses OpenSSH and asks for the password through SSH_ASKPASS.
+// The password itself is never an argument.
 QStringList sshLaunchArgs(bool tailscaleSsh, const QString &target, int port, bool trustNext,
-                          const QString &controlPath);
+                          const QString &controlPath, bool withPassword = false);
+
+// A private helper ssh runs when a password was typed. The helper reads
+// SHARES_SSH_PASSWORD from the environment. The password is not in the file.
+QString sshAskpassProgram(QString *error);
 
 // Library probes (systemctl, hostname, targetcli) go through this while a
 // remote computer is selected. File bodies travel separately, on stdin.

@@ -9,16 +9,22 @@
 #include <QJsonObject>
 #include <QMutexLocker>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
 
+#include <utility>
+
 namespace {
 
-CommandResult runProcess(const QString &program, const QStringList &args, const QString &input, int timeoutMs) {
+CommandResult runProcess(const QString &program, const QStringList &args, const QString &input, int timeoutMs,
+                         const QProcessEnvironment *env = nullptr) {
     if (QStandardPaths::findExecutable(program).isEmpty())
         return {127, {}, program + " is not installed", true};
     QProcess process;
+    if (env)
+        process.setProcessEnvironment(*env);
     process.start(program, args);
     if (!process.waitForStarted(5000))
         return {127, {}, process.errorString(), true};
@@ -256,17 +262,7 @@ bool parseRemoteBatch(const QByteArray &payload, const QVector<ProbeRequest> &pr
     return true;
 }
 
-} // namespace
-
-SshLink::SshLink(QString user, QString host, int port, bool tailscaleSsh)
-    : m_target(user + "@" + host), m_port(port), m_tailscaleSsh(tailscaleSsh) {}
-
-void SshLink::trustNextKey() { m_trustNext = true; }
-
-QString SshLink::controlSocket() {
-    if (m_controlReady)
-        return m_controlPath;
-    m_controlReady = true;
+QString sshRuntimeDir() {
     auto base = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
     if (base.isEmpty())
         base = QDir::homePath() + QStringLiteral("/.cache");
@@ -274,6 +270,23 @@ QString SshLink::controlSocket() {
     if (!QDir().mkpath(dir))
         return {};
     QFile::setPermissions(dir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    return dir;
+}
+
+} // namespace
+
+SshLink::SshLink(QString user, QString host, int port, bool tailscaleSsh, QString password)
+    : m_target(user + "@" + host), m_password(std::move(password)), m_port(port), m_tailscaleSsh(tailscaleSsh) {}
+
+void SshLink::trustNextKey() { m_trustNext = true; }
+
+QString SshLink::controlSocket() {
+    if (m_controlReady)
+        return m_controlPath;
+    m_controlReady = true;
+    const auto dir = sshRuntimeDir();
+    if (dir.isEmpty())
+        return {};
     const auto path = dir + QStringLiteral("/%C");
     // OpenSSH expands %C. The template has to fit a unix socket path, and a
     // space or quote would split the option.
@@ -283,13 +296,46 @@ QString SshLink::controlSocket() {
     return m_controlPath;
 }
 
-QStringList sshLaunchArgs(bool tailscaleSsh, const QString &target, int port, bool trustNext, const QString &controlPath) {
-    if (tailscaleSsh) {
+QString sshAskpassProgram(QString *error) {
+    const auto fail = [error] {
+        if (error)
+            *error = QStringLiteral("Could not prepare the password prompt.");
+        return QString();
+    };
+    const auto dir = sshRuntimeDir();
+    if (dir.isEmpty())
+        return fail();
+    const auto path = dir + QStringLiteral("/askpass");
+    QFileInfo info(path);
+    if (info.exists() && info.isExecutable())
+        return path;
+    QSaveFile out(path);
+    if (!out.open(QIODevice::WriteOnly))
+        return fail();
+    // The password stays in the ssh process environment. This file only prints it.
+    const QByteArray script = "#!/bin/sh\nprintf '%s\\n' \"$SHARES_SSH_PASSWORD\"\n";
+    if (out.write(script) != script.size() || !out.commit())
+        return fail();
+    QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    return path;
+}
+
+QStringList sshLaunchArgs(bool tailscaleSsh, const QString &target, int port, bool trustNext, const QString &controlPath,
+                          bool withPassword) {
+    if (tailscaleSsh && !withPassword) {
         // tailscale ssh reaches a peer that has Tailscale SSH on, without a
         // separate sshd key. It does not take OpenSSH control sockets.
         return {"tailscale", "ssh", target};
     }
-    QStringList args{"ssh", "-T", "-p", QString::number(port), "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"};
+    // A typed password cannot ride along with BatchMode, and Tailscale SSH
+    // does not take an account password. OpenSSH asks SSH_ASKPASS instead.
+    QStringList args{"ssh", "-T", "-p", QString::number(port), "-o", "ConnectTimeout=8"};
+    if (withPassword) {
+        args << "-o" << "BatchMode=no" << "-o" << "PubkeyAuthentication=no" << "-o"
+             << "PreferredAuthentications=password,keyboard-interactive" << "-o" << "NumberOfPasswordPrompts=1";
+    } else {
+        args << "-o" << "BatchMode=yes";
+    }
     const bool multiplex = !controlPath.isEmpty() && controlPath.size() <= 80 && !controlPath.contains(u' ')
         && !controlPath.contains(u'\'');
     if (multiplex) {
@@ -303,11 +349,26 @@ QStringList sshLaunchArgs(bool tailscaleSsh, const QString &target, int port, bo
 CommandResult SshLink::exec(const QStringList &argv, const QString &input, int timeoutMs) {
     QMutexLocker lock(&m_execLock);
     const auto trustNext = m_trustNext;
-    if (!m_tailscaleSsh)
+    const bool withPassword = !m_password.isEmpty();
+    if (!m_tailscaleSsh || withPassword)
         m_trustNext = false;
-    auto args = sshLaunchArgs(m_tailscaleSsh, m_target, m_port, trustNext, m_tailscaleSsh ? QString() : controlSocket());
+    QProcessEnvironment env;
+    const QProcessEnvironment *envPtr = nullptr;
+    if (withPassword) {
+        QString askError;
+        const auto askpass = sshAskpassProgram(&askError);
+        if (askpass.isEmpty())
+            return {1, {}, askError.isEmpty() ? QStringLiteral("Could not prepare the password prompt.") : askError, false};
+        env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("SSH_ASKPASS"), askpass);
+        env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("force"));
+        env.insert(QStringLiteral("SHARES_SSH_PASSWORD"), m_password);
+        envPtr = &env;
+    }
+    auto args = sshLaunchArgs(m_tailscaleSsh, m_target, m_port, trustNext, withPassword ? controlSocket() : (m_tailscaleSsh ? QString() : controlSocket()),
+                              withPassword);
     args += argv;
-    return runProcess(args.first(), args.mid(1), input, timeoutMs);
+    return runProcess(args.first(), args.mid(1), input, timeoutMs, envPtr);
 }
 
 CommandResult RemoteCommands::run(const QString &program, const QStringList &args, const QString &input, int timeoutMs) {

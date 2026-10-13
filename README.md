@@ -64,7 +64,7 @@ Names this machine is reachable as are read when the window opens. They are not 
 
 Press `H`, or the H in the top bar. This computer is always first. `J` and `K` move through the list, and Enter opens the highlighted computer.
 
-If Tailscale is running on this computer, Shares reads `tailscale status` and lists the peers that are online. A peer with Tailscale SSH is opened with `tailscale ssh`. Any other peer is opened with OpenSSH to its MagicDNS name, or to its Tailscale address when that name is empty. The connection uses the SSH key you already have. Shares does not store a password, and it does not ask SSH to prompt for one.
+If Tailscale is running on this computer, Shares reads `tailscale status` and lists the peers that are online. Each peer has a user and a password. The user is remembered in the Shares config file. The password is used for that connection and is not written down. Leave the password empty and a peer with Tailscale SSH is opened with `tailscale ssh`. Any other peer is opened with OpenSSH to its MagicDNS name, or to its Tailscale address when that name is empty, using the SSH key you already have. A password uses OpenSSH instead, and Shares asks SSH for that password without putting it on the command line.
 
 A computer that is not on the tailnet can be typed as a user, a host, and a port. Those names are kept in the Shares config file, readable only by you. The first connection requires a host key you already trust. Trust key accepts that key once. Later connections check it again.
 

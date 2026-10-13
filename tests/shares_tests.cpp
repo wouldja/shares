@@ -1037,6 +1037,84 @@ private slots:
         QVERIFY(!skipped.join(' ').contains("ControlMaster"));
         const auto empty = sshLaunchArgs(false, "share@files.example.net", 22, false, {});
         QVERIFY(!empty.join(' ').contains("ControlMaster"));
+
+        const auto password = sshLaunchArgs(true, "share@files.example.net", 22, false, "/run/user/1000/shares-ssh/%C", true);
+        QCOMPARE(password.first(), QString("ssh"));
+        QVERIFY(password.contains("BatchMode=no"));
+        QVERIFY(!password.contains("BatchMode=yes"));
+        QVERIFY(password.contains("PubkeyAuthentication=no"));
+        QVERIFY(password.contains("PreferredAuthentications=password,keyboard-interactive"));
+        QVERIFY(password.contains("NumberOfPasswordPrompts=1"));
+        QVERIFY(password.contains("ControlMaster=auto"));
+        QVERIFY(!password.join(' ').contains("tailscale"));
+        QVERIFY(!password.join(' ').contains("n0t-st0red"));
+    }
+
+    void tailscaleLoginRemembersTheUserNotThePassword() {
+        QTemporaryDir dir;
+        const auto hosts = dir.path() + "/hosts.json";
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json",
+                              {0,
+                               QString(R"({"Self":{"DNSName":"files.example.ts.net."},"Peer":{"pve":{"HostName":"pve","DNSName":"pve.example.ts.net.","Online":true,"TailscaleIPs":["100.100.100.2"],"sshHostKeys":["ssh-ed25519 AAAA"]}}})"),
+                               {},
+                               false});
+        Backend backend(dir.path(), &commands);
+        backend.setHostsFile(hosts);
+        QString pveId;
+        for (const auto &row : backend.hosts()) {
+            if (row.toMap().value("name").toString() == "pve")
+                pveId = row.toMap().value("id").toString();
+        }
+        QCOMPARE(pveId, QString("ts:pve.example.ts.net"));
+        backend.setHostLogin(pveId, "root", "n0t-st0red");
+        backend.setHostLogin("saved:nope", "root", "n0t-st0red");
+        backend.refreshHosts();
+        const auto saved = readFile(hosts);
+        QVERIFY(saved.contains("root"));
+        QVERIFY(saved.contains("ts:pve.example.ts.net"));
+        QVERIFY(!saved.contains("n0t-st0red"));
+        QVERIFY(!saved.contains("password"));
+        bool sawPassword = false;
+        for (const auto &row : backend.hosts()) {
+            const auto map = row.toMap();
+            if (map.value("id").toString() != pveId)
+                continue;
+            QCOMPARE(map.value("user").toString(), QString("root"));
+            QCOMPARE(map.value("password").toString(), QString("n0t-st0red"));
+            QVERIFY(map.value("detail").toString().contains("root"));
+            sawPassword = true;
+        }
+        QVERIFY(sawPassword);
+
+        Backend again(dir.path(), &commands);
+        again.setHostsFile(hosts);
+        for (const auto &row : again.hosts()) {
+            const auto map = row.toMap();
+            if (map.value("id").toString() != pveId)
+                continue;
+            QCOMPARE(map.value("user").toString(), QString("root"));
+            QVERIFY(map.value("password").toString().isEmpty());
+        }
+
+        QString askError;
+        const auto askpass = sshAskpassProgram(&askError);
+        QVERIFY2(!askpass.isEmpty(), qPrintable(askError));
+        QFileInfo info(askpass);
+        QVERIFY(info.isExecutable());
+        QVERIFY(!(info.permissions() & QFileDevice::ReadGroup));
+        QVERIFY(!(info.permissions() & QFileDevice::ReadOther));
+        const auto script = readFile(askpass);
+        QVERIFY(script.contains("SHARES_SSH_PASSWORD"));
+        QVERIFY(!script.contains("n0t-st0red"));
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("SHARES_SSH_PASSWORD"), QStringLiteral("n0t-st0red"));
+        QProcess process;
+        process.setProcessEnvironment(env);
+        process.start(askpass, {});
+        QVERIFY(process.waitForFinished(3000));
+        QCOMPARE(process.exitCode(), 0);
+        QCOMPARE(QString::fromUtf8(process.readAllStandardOutput()), QString("n0t-st0red\n"));
     }
 
     void themeFallsBack() {

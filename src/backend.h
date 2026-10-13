@@ -4,6 +4,7 @@
 #include "remote.h"
 #include "store.h"
 
+#include <QHash>
 #include <QObject>
 #include <QTemporaryDir>
 #include <QVariant>
@@ -86,7 +87,7 @@ public:
     bool canInstall() const { return m_canInstall; }
     bool canTrustHost() const { return m_canTrustHost; }
     bool connecting() const { return m_connecting; }
-    void setHostsFile(const QString &path) { m_hostsFile = path; }
+    void setHostsFile(const QString &path);
 
     Q_INVOKABLE void setProtocol(int protocol);
     Q_INVOKABLE void move(int delta);
@@ -118,7 +119,8 @@ public:
     Q_INVOKABLE bool createAccess(const QString &backend, const QString &name, const QString &secret);
     Q_INVOKABLE bool removeAccess(const QString &backend, const QString &name);
     Q_INVOKABLE void refreshHosts();
-    Q_INVOKABLE bool useHost(const QString &id, const QString &user = {});
+    Q_INVOKABLE void setHostLogin(const QString &id, const QString &user, const QString &password);
+    Q_INVOKABLE bool useHost(const QString &id, const QString &user = {}, const QString &password = {});
     Q_INVOKABLE bool addHost(const QString &user, const QString &host, int port);
     Q_INVOKABLE bool leaveComputer();
     Q_INVOKABLE bool installNeeds();
@@ -246,6 +248,7 @@ private:
     QString m_needsText;
     QString m_pendingUser;
     QString m_pendingHost;
+    QString m_pendingPassword;
     int m_pendingPort = 22;
     bool m_pendingTailscaleSsh = false;
     bool m_canInstall = false;
@@ -256,6 +259,10 @@ private:
     QVariantList m_hostRows;
     QVector<RemoteHost> m_saved;
     QVector<RemoteHost> m_peers;
+    // Tailscale row logins, keyed by "ts:" + host. Users are written to the
+    // host file. Passwords stay in this process and are not written.
+    QHash<QString, QString> m_loginUsers;
+    QHash<QString, QString> m_loginPasswords;
     OsProfile m_localProfile;
     OsProfile m_remoteProfile;
     QStringList m_neededPackages;

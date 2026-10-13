@@ -31,11 +31,13 @@ ApplicationWindow {
     property bool needsOpen: false
     property bool leaveOpen: false
     property int hostCursor: 0
+    property int hostFieldFocus: 0
     readonly property bool typing: filterField.activeFocus || nameField.activeFocus || pathField.activeFocus
         || editorField.activeFocus || globalField.activeFocus || importField.activeFocus
         || accountField.activeFocus || secretField.activeFocus || serviceField.activeFocus
         || hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus
         || remoteFolderField.activeFocus || remoteImageField.activeFocus
+        || hostFieldFocus > 0
     readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || needsOpen || leaveOpen
     property int browseCursor: 0
     readonly property bool letters: !overlay && !typing
@@ -225,11 +227,15 @@ ApplicationWindow {
         }
         if (hostCursor < 0 || hostCursor >= backend.hosts.length)
             return
-        if (backend.hosts[hostCursor].id === "local") {
+        var row = backend.hosts[hostCursor]
+        if (row.id === "local") {
             requestDisconnect()
             return
         }
-        backend.useHost(backend.hosts[hostCursor].id, hostUserField.text)
+        if (row.via === "tailscale")
+            backend.useHost(row.id)
+        else
+            backend.useHost(row.id, hostUserField.text)
     }
 
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !typing; onActivated: helpOpen = !helpOpen }
@@ -271,8 +277,8 @@ ApplicationWindow {
     Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
     Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(1) }
     Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
-    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: hostsOpen; onActivated: activateHost() }
-    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: hostsOpen; onActivated: activateHost() }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: hostsOpen && hostFieldFocus === 0; onActivated: activateHost() }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: hostsOpen && hostFieldFocus === 0; onActivated: activateHost() }
     Shortcut { sequence: "D"; context: Qt.ApplicationShortcut; enabled: letters && backend.hasSelection; onActivated: removeOpen = true }
     Shortcut { sequence: "U"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: passwordsOpen = true }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; enabled: !overlay && !filterField.activeFocus; onActivated: filterField.forceActiveFocus() }
@@ -859,6 +865,7 @@ ApplicationWindow {
         function onCreatePathChosen(path) { win.usePickedPath(path) }
         function onNeedsReady() { needsOpen = true }
         function onComputerReady() { hostsOpen = false }
+        function onHostChanged() { win.hostFieldFocus = 0 }
         function onBrowseChanged() { win.browseCursor = 0; if (browseFlick) browseFlick.contentY = 0 }
     }
 
@@ -984,7 +991,7 @@ ApplicationWindow {
             width: 424
             spacing: 8
             Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-            Text { width: 424; wrapMode: Text.Wrap; text: "Tailscale lists the machines on this tailnet. J and K move. Enter opens the highlighted computer as the SSH user below, or as this login. A typed host uses SSH and the key you already have."; color: "#7e8089"; font.family: win.font.family }
+            Text { width: 424; wrapMode: Text.Wrap; text: "Each Tailscale machine has a user and a password. J and K move. Enter opens the highlighted computer. Leave the password empty to use Tailscale SSH or the key you already have. The password is not saved. A typed host below uses that key."; color: "#7e8089"; font.family: win.font.family }
             Flickable {
                 width: 424
                 height: 220
@@ -997,14 +1004,113 @@ ApplicationWindow {
                     Repeater {
                         model: backend.hosts
                         delegate: Rectangle {
+                            id: hostRow
                             required property var modelData
                             required property int index
                             width: 424
-                            height: 46
+                            height: modelData.via === "tailscale" ? tailCreds.implicitHeight + 12 : 46
                             color: index === win.hostCursor ? "#22222c" : "#0f0f18"
                             border.color: index === win.hostCursor ? "#6b6d76" : "#424247"
                             border.width: 1
+
+                            function openThisHost() {
+                                win.hostCursor = index
+                                if (modelData.id === "local") {
+                                    win.requestDisconnect()
+                                    return
+                                }
+                                if (modelData.via === "tailscale") {
+                                    backend.setHostLogin(modelData.id, peerUser.text, peerPassword.text)
+                                    backend.useHost(modelData.id, peerUser.text, peerPassword.text)
+                                    return
+                                }
+                                backend.useHost(modelData.id, hostUserField.text)
+                            }
+
+                            function noteHostFocus(focused) {
+                                if (focused) {
+                                    win.hostCursor = index
+                                    win.hostFieldFocus = 1
+                                    return
+                                }
+                                Qt.callLater(function() {
+                                    if (!peerUser.activeFocus && !peerPassword.activeFocus)
+                                        win.hostFieldFocus = 0
+                                })
+                            }
+
+                            function fillLogin() {
+                                if (!peerUser.activeFocus)
+                                    peerUser.text = modelData.user
+                                if (!peerPassword.activeFocus)
+                                    peerPassword.text = modelData.password
+                            }
+
+                            Component.onCompleted: fillLogin()
+                            onModelDataChanged: fillLogin()
+
                             Column {
+                                id: tailCreds
+                                visible: modelData.via === "tailscale"
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 8
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 4
+                                Item {
+                                    width: parent.width
+                                    height: peerName.implicitHeight + peerDetail.implicitHeight + 2
+                                    Text { id: peerName; width: parent.width; elide: Text.ElideRight; text: modelData.name; color: "#bcbec8"; font.family: win.font.family }
+                                    Text {
+                                        id: peerDetail
+                                        width: parent.width
+                                        anchors.top: peerName.bottom
+                                        elide: Text.ElideRight
+                                        text: modelData.detail
+                                        color: "#7e8089"
+                                        font.pixelSize: 11
+                                        font.family: win.font.family
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: hostRow.openThisHost()
+                                    }
+                                }
+                                Row {
+                                    width: parent.width
+                                    spacing: 8
+                                    TextField {
+                                        id: peerUser
+                                        width: 150
+                                        placeholderText: "User"
+                                        placeholderTextColor: "#7e8089"
+                                        color: "#a1a3ad"
+                                        font.family: win.font.family
+                                        inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+                                        background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                                        onActiveFocusChanged: hostRow.noteHostFocus(activeFocus)
+                                        onTextEdited: backend.setHostLogin(modelData.id, text, peerPassword.text)
+                                        onAccepted: hostRow.openThisHost()
+                                    }
+                                    TextField {
+                                        id: peerPassword
+                                        width: parent.width - 158
+                                        echoMode: TextInput.Password
+                                        placeholderText: "Password"
+                                        placeholderTextColor: "#7e8089"
+                                        color: "#a1a3ad"
+                                        font.family: win.font.family
+                                        inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                                        background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                                        onActiveFocusChanged: hostRow.noteHostFocus(activeFocus)
+                                        onTextEdited: backend.setHostLogin(modelData.id, peerUser.text, text)
+                                        onAccepted: hostRow.openThisHost()
+                                    }
+                                }
+                            }
+                            Column {
+                                visible: modelData.via !== "tailscale"
                                 anchors.left: parent.left
                                 anchors.right: parent.right
                                 anchors.leftMargin: 8
@@ -1016,14 +1122,8 @@ ApplicationWindow {
                             }
                             MouseArea {
                                 anchors.fill: parent
-                                onClicked: {
-                                    win.hostCursor = index
-                                    if (modelData.id === "local") {
-                                        win.requestDisconnect()
-                                        return
-                                    }
-                                    backend.useHost(modelData.id, hostUserField.text)
-                                }
+                                visible: modelData.via !== "tailscale"
+                                onClicked: hostRow.openThisHost()
                             }
                         }
                     }
