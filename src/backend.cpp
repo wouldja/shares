@@ -8,6 +8,7 @@
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDate>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -20,7 +21,9 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 #include <QThreadPool>
+#include <QUrl>
 
 #include <utility>
 
@@ -82,6 +85,75 @@ QString advancedLabel(int count) {
 bool usersOk(const QString &text) {
     static const QRegularExpression re("^[A-Za-z0-9_@, .$-]*$");
     return re.match(text).hasMatch() && !text.contains(QStringLiteral(".."));
+}
+
+bool smbHostOk(const QString &host) {
+    static const QRegularExpression re("^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$");
+    return re.match(host).hasMatch() && !host.contains("..") && !host.endsWith('.');
+}
+
+struct SmbScanResult {
+    QVariantList shares;
+    QString error;
+};
+
+SmbScanResult scanSmbShares(const QString &host, const QString &user, const QString &password) {
+    SmbScanResult result;
+    const auto smbclient = QStandardPaths::findExecutable(QStringLiteral("smbclient"));
+    if (smbclient.isEmpty()) {
+        result.error = QStringLiteral("smbclient is not installed on this computer. Install the smbclient package.");
+        return result;
+    }
+
+    QStringList args{QStringLiteral("-g"), QStringLiteral("-L"), QStringLiteral("//") + host};
+    QTemporaryFile auth;
+    if (!user.isEmpty() || !password.isEmpty()) {
+        if (!auth.open()) {
+            result.error = QStringLiteral("Could not prepare private SMB credentials.");
+            return result;
+        }
+        auth.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        const auto credentials = QStringLiteral("username = %1\npassword = %2\n").arg(user, password).toUtf8();
+        if (auth.write(credentials) != credentials.size() || !auth.flush()) {
+            result.error = QStringLiteral("Could not prepare private SMB credentials.");
+            return result;
+        }
+        args << QStringLiteral("-A") << auth.fileName();
+        auth.close();
+    } else {
+        args << QStringLiteral("-N");
+    }
+
+    QProcess process;
+    process.start(smbclient, args);
+    if (!process.waitForStarted(5000)) {
+        result.error = QStringLiteral("Could not start smbclient: ") + process.errorString();
+        return result;
+    }
+    if (!process.waitForFinished(20000)) {
+        process.kill();
+        process.waitForFinished(1000);
+        result.error = QStringLiteral("Searching SMB shares timed out.");
+        return result;
+    }
+
+    const auto output = QString::fromUtf8(process.readAllStandardOutput());
+    const auto stderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
+    for (const auto &line : output.split('\n')) {
+        const auto fields = line.trimmed().split('|');
+        if (fields.size() < 2 || fields.at(0).compare(QStringLiteral("Disk"), Qt::CaseInsensitive) != 0)
+            continue;
+        const auto name = fields.at(1).trimmed();
+        if (name.isEmpty() || name.endsWith('$'))
+            continue;
+        result.shares.append(QVariantMap{{"name", name},
+                                         {"comment", fields.size() > 2 ? fields.mid(2).join('|').trimmed() : QString()}});
+    }
+    if (process.exitCode() != 0 && result.shares.isEmpty())
+        result.error = stderrText.isEmpty() ? QStringLiteral("Could not list shares on %1.").arg(host) : stderrText;
+    else if (result.shares.isEmpty())
+        result.error = QStringLiteral("No visible SMB shares were found on %1.").arg(host);
+    return result;
 }
 
 bool nfsReadOnly(const NfsExport &exp) {
@@ -2496,12 +2568,16 @@ void Backend::setHostLogin(const QString &id, const QString &user, const QString
         writeSavedHosts();
 }
 
-bool Backend::addHost(const QString &user, const QString &hostName, int port) {
+bool Backend::addHost(const QString &user, const QString &hostName, int port, const QString &password) {
     const auto userName = user.trimmed().isEmpty() ? localUser() : user.trimmed();
     const auto host = hostName.trimmed();
     const int actualPort = port == 0 ? 22 : port;
     if (!remoteTargetOk(userName, host, actualPort)) {
-        setError(QStringLiteral("Use a plain user, host, and port. Shares keeps the SSH key you already have."));
+        setError(QStringLiteral("Use a plain user, host, and port."));
+        return false;
+    }
+    if (password.contains(u'\n') || password.contains(u'\r')) {
+        setError(QStringLiteral("The SSH password cannot contain a line break."));
         return false;
     }
     if (m_dirty && !m_undo.isEmpty()) {
@@ -2514,6 +2590,7 @@ bool Backend::addHost(const QString &user, const QString &hostName, int port) {
     remote.host = host;
     remote.port = actualPort;
     remote.via = "ssh";
+    remote.password = password;
     bool replaced = false;
     for (auto &saved : m_saved) {
         if (saved.user == remote.user && saved.host == remote.host && saved.port == remote.port) {
@@ -2523,9 +2600,92 @@ bool Backend::addHost(const QString &user, const QString &hostName, int port) {
     }
     if (!replaced)
         m_saved.append(remote);
+    // Keep the host address and user for later, but never persist the password.
+    for (auto &saved : m_saved) {
+        if (saved.user == remote.user && saved.host == remote.host && saved.port == remote.port)
+            saved.password.clear();
+    }
     writeSavedHosts();
     publishHosts();
     return connectRemote(remote);
+}
+
+void Backend::clearSmbShares() {
+    ++m_smbWave;
+    m_smbHost.clear();
+    m_smbError.clear();
+    m_smbShares.clear();
+    m_smbScanning = false;
+    emit smbChanged();
+}
+
+void Backend::discoverSmbShares(const QString &hostName, const QString &userName, const QString &password) {
+    const auto host = hostName.trimmed();
+    const auto user = userName.trimmed();
+    if (!smbHostOk(host)) {
+        m_smbError = QStringLiteral("Enter a host name or IPv4 address.");
+        m_smbShares.clear();
+        m_smbScanning = false;
+        emit smbChanged();
+        return;
+    }
+    if (user.contains(u'\n') || user.contains(u'\r') || password.contains(u'\n') || password.contains(u'\r')) {
+        m_smbError = QStringLiteral("The SMB username and password cannot contain line breaks.");
+        m_smbShares.clear();
+        m_smbScanning = false;
+        emit smbChanged();
+        return;
+    }
+    if (user.isEmpty() && !password.isEmpty()) {
+        m_smbError = QStringLiteral("Enter a username with the password, or leave both fields empty for guest access.");
+        m_smbShares.clear();
+        m_smbScanning = false;
+        emit smbChanged();
+        return;
+    }
+
+    const int wave = ++m_smbWave;
+    m_smbHost = host;
+    m_smbError.clear();
+    m_smbShares.clear();
+    m_smbScanning = true;
+    emit smbChanged();
+
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([host, user, password, wave, self] {
+        const auto result = scanSmbShares(host, user, password);
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app,
+            [self, wave, result] {
+                if (!self || wave != self->m_smbWave)
+                    return;
+                self->m_smbScanning = false;
+                self->m_smbShares = result.shares;
+                self->m_smbError = result.error;
+                emit self->smbChanged();
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+bool Backend::openSmbShare(int index) {
+    if (index < 0 || index >= m_smbShares.size() || m_smbHost.isEmpty())
+        return false;
+    const auto name = m_smbShares.at(index).toMap().value(QStringLiteral("name")).toString();
+    if (name.isEmpty())
+        return false;
+    QUrl url;
+    url.setScheme(QStringLiteral("smb"));
+    url.setHost(m_smbHost);
+    url.setPath(QStringLiteral("/") + name);
+    if (QDesktopServices::openUrl(url))
+        return true;
+    m_smbError = QStringLiteral("Could not open the share. Install a file manager with SMB support (gvfs-smb on Arch).");
+    emit smbChanged();
+    return false;
 }
 
 bool Backend::leaveComputer() {

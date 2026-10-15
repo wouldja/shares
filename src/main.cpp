@@ -49,7 +49,7 @@ int main(int argc, char *argv[]) {
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("shares");
-    app.setApplicationVersion("0.2.4");
+    app.setApplicationVersion("0.2.5");
 
     // Matches the window to shares.desktop, so the compositor (Wayland app_id)
     // and the launcher pick up the installed icon.

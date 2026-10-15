@@ -66,7 +66,9 @@ Press `H`, or the H in the top bar. This computer is always first. `J` and `K` m
 
 If Tailscale is running on this computer, Shares reads `tailscale status` and lists the peers that are online. Each peer has a user and a password. The user is remembered in the Shares config file. The password is used for that connection and is not written down. Leave the password empty and a peer with Tailscale SSH is opened with `tailscale ssh`. Any other peer is opened with OpenSSH to its MagicDNS name, or to its Tailscale address when that name is empty, using the SSH key you already have. A password uses OpenSSH instead, and Shares asks SSH for that password without putting it on the command line.
 
-A computer that is not on the tailnet can be typed as a user, a host, and a port. Those names are kept in the Shares config file, readable only by you. The first connection requires a host key you already trust. Trust key accepts that key once. Later connections check it again.
+The Computers window also has **Windows shares**. Enter a Windows or SMB server name or LAN IP to list its visible shares, then open one in your file manager. Share discovery uses `smbclient`; opening a share needs your desktop's SMB file manager support, such as `gvfs-smb`. Credentials are used for discovery only and are not saved. Your file manager may ask for them again when you open a share.
+
+A computer that is not on the tailnet can be typed as a user, a host or LAN IP address, a port, and an optional SSH password. Passwords are used for the connection only and are not saved; leave the field empty to use your SSH key. The host name, user, and port are kept in the Shares config file, readable only by you. The first connection requires a host key you already trust. Trust key accepts that key once. Later connections check it again.
 
 The other computer does not need this window. It needs OpenSSH (`sshd`) or Tailscale SSH, `python3`, and passwordless `sudo` for the SSH user. Shares copies a small apply helper there and sends the same file plan it would write locally. The helper allows the same paths and commands, and a removal still leaves the folder, disk image, dataset, or zvol in place.
 
@@ -109,7 +111,7 @@ The build needs `base-devel`, `qt6-base`, `qt6-declarative`, and `qt6-wayland`. 
 omarchy pkg add base-devel qt6-base qt6-declarative qt6-wayland
 ```
 
-Install a service only when you want that protocol: `samba`, `nfs-utils`, `targetcli-fb`, `mc`, `garage`, `ceph`, or `curl` for RustFS. Saving needs `polkit`. RustFS is managed at `http://127.0.0.1:9000` unless `/etc/shares/s3.json` sets another loopback port.
+Install a service only when you want that protocol: `samba`, `nfs-utils`, `targetcli-fb`, `mc`, `garage`, `ceph`, or `curl` for RustFS. SMB browsing uses `smbclient` and `gvfs-smb`, which the package installs. Saving needs `polkit`. RustFS is managed at `http://127.0.0.1:9000` unless `/etc/shares/s3.json` sets another loopback port.
 
 Regenerate the pictures in `docs/` with `docs/mockups/render.py`, then screenshot each HTML page at 1200×760.
 

@@ -48,6 +48,9 @@ class Backend : public QObject {
     Q_PROPERTY(bool canInstall READ canInstall NOTIFY hostChanged)
     Q_PROPERTY(bool canTrustHost READ canTrustHost NOTIFY hostChanged)
     Q_PROPERTY(bool connecting READ connecting NOTIFY hostChanged)
+    Q_PROPERTY(bool smbScanning READ smbScanning NOTIFY smbChanged)
+    Q_PROPERTY(QString smbError READ smbError NOTIFY smbChanged)
+    Q_PROPERTY(QVariantList smbShares READ smbShares NOTIFY smbChanged)
 
 public:
     explicit Backend(const QString &root = {}, Commands *commands = nullptr, FilePicker *picker = nullptr,
@@ -87,6 +90,9 @@ public:
     bool canInstall() const { return m_canInstall; }
     bool canTrustHost() const { return m_canTrustHost; }
     bool connecting() const { return m_connecting; }
+    bool smbScanning() const { return m_smbScanning; }
+    QString smbError() const { return m_smbError; }
+    QVariantList smbShares() const { return m_smbShares; }
     void setHostsFile(const QString &path);
 
     Q_INVOKABLE void setProtocol(int protocol);
@@ -121,7 +127,10 @@ public:
     Q_INVOKABLE void refreshHosts();
     Q_INVOKABLE void setHostLogin(const QString &id, const QString &user, const QString &password);
     Q_INVOKABLE bool useHost(const QString &id, const QString &user = {}, const QString &password = {});
-    Q_INVOKABLE bool addHost(const QString &user, const QString &host, int port);
+    Q_INVOKABLE bool addHost(const QString &user, const QString &host, int port, const QString &password = {});
+    Q_INVOKABLE void clearSmbShares();
+    Q_INVOKABLE void discoverSmbShares(const QString &host, const QString &user, const QString &password);
+    Q_INVOKABLE bool openSmbShare(int index);
     Q_INVOKABLE bool leaveComputer();
     Q_INVOKABLE bool installNeeds();
     Q_INVOKABLE bool trustHost();
@@ -138,6 +147,7 @@ signals:
     void hostChanged();
     void needsReady();
     void computerReady();
+    void smbChanged();
 
 private:
     struct Snapshot {
@@ -256,6 +266,11 @@ private:
     bool m_connecting = false;
     bool m_trustNextConnect = false;
     QString m_restoreTitle;
+    QString m_smbHost;
+    QString m_smbError;
+    QVariantList m_smbShares;
+    int m_smbWave = 0;
+    bool m_smbScanning = false;
     QVariantList m_hostRows;
     QVector<RemoteHost> m_saved;
     QVector<RemoteHost> m_peers;
