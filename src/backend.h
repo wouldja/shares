@@ -6,9 +6,16 @@
 
 #include <QHash>
 #include <QObject>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QVariant>
 #include <memory>
+
+// smbclient -g -L lines. Disk shares stay; IPC and Windows admin shares do not.
+QVariantList parseSmbGrepableList(const QString &output);
+
+// Addresses on one private subnet. A prefix shorter than /22 is refused.
+QStringList lanIpv4Hosts(const QString &address, int prefix, QString *error);
 
 // The window's state. File edits stay in memory until Save. Save of the real
 // machine goes through pkexec; tests pass a temporary root and a fake runner
@@ -49,6 +56,7 @@ class Backend : public QObject {
     Q_PROPERTY(bool canTrustHost READ canTrustHost NOTIFY hostChanged)
     Q_PROPERTY(bool connecting READ connecting NOTIFY hostChanged)
     Q_PROPERTY(bool smbScanning READ smbScanning NOTIFY smbChanged)
+    Q_PROPERTY(QString smbStatus READ smbStatus NOTIFY smbChanged)
     Q_PROPERTY(QString smbError READ smbError NOTIFY smbChanged)
     Q_PROPERTY(QVariantList smbShares READ smbShares NOTIFY smbChanged)
 
@@ -91,6 +99,7 @@ public:
     bool canTrustHost() const { return m_canTrustHost; }
     bool connecting() const { return m_connecting; }
     bool smbScanning() const { return m_smbScanning; }
+    QString smbStatus() const { return m_smbStatus; }
     QString smbError() const { return m_smbError; }
     QVariantList smbShares() const { return m_smbShares; }
     void setHostsFile(const QString &path);
@@ -130,6 +139,7 @@ public:
     Q_INVOKABLE bool addHost(const QString &user, const QString &host, int port, const QString &password = {});
     Q_INVOKABLE void clearSmbShares();
     Q_INVOKABLE void discoverSmbShares(const QString &host, const QString &user, const QString &password);
+    Q_INVOKABLE void scanSmbNetwork(const QString &user, const QString &password);
     Q_INVOKABLE bool openSmbShare(int index);
     Q_INVOKABLE bool leaveComputer();
     Q_INVOKABLE bool installNeeds();
@@ -268,6 +278,7 @@ private:
     QString m_restoreTitle;
     QString m_smbHost;
     QString m_smbError;
+    QString m_smbStatus;
     QVariantList m_smbShares;
     int m_smbWave = 0;
     bool m_smbScanning = false;

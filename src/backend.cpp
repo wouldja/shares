@@ -23,7 +23,18 @@
 #include <QStandardPaths>
 #include <QTemporaryFile>
 #include <QThreadPool>
+#include <QDeadlineTimer>
 #include <QUrl>
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <utility>
 
@@ -92,12 +103,255 @@ bool smbHostOk(const QString &host) {
     return re.match(host).hasMatch() && !host.contains("..") && !host.endsWith('.');
 }
 
+} // namespace
+
+bool windowsAdminShare(const QString &name) {
+    const auto upper = name.toUpper();
+    if (upper == QLatin1String("IPC$") || upper == QLatin1String("ADMIN$") || upper == QLatin1String("PRINT$") ||
+        upper == QLatin1String("FAX$"))
+        return true;
+    // Windows publishes each drive as C$, D$, and so on. A longer name such as
+    // zfsback1$ is a real share that happens to use the same character.
+    return upper.size() == 2 && upper.at(0).isLetter() && upper.at(1) == QLatin1Char('$');
+}
+
+QVariantList parseSmbGrepableList(const QString &output) {
+    QVariantList shares;
+    for (const auto &line : output.split('\n')) {
+        const auto fields = line.trimmed().split('|');
+        if (fields.size() < 2 || fields.at(0).compare(QStringLiteral("Disk"), Qt::CaseInsensitive) != 0)
+            continue;
+        const auto name = fields.at(1).trimmed();
+        if (name.isEmpty() || windowsAdminShare(name))
+            continue;
+        shares.append(QVariantMap{{QStringLiteral("name"), name},
+                                  {QStringLiteral("comment"), fields.size() > 2 ? fields.mid(2).join('|').trimmed() : QString()}});
+    }
+    return shares;
+}
+
+QStringList lanIpv4Hosts(const QString &address, int prefix, QString *error) {
+    const auto reject = [error](const QString &message) {
+        if (error)
+            *error = message;
+        return QStringList{};
+    };
+    const auto parts = address.split('.');
+    if (parts.size() != 4 || prefix < 0 || prefix > 32)
+        return reject(QStringLiteral("The network address is not usable."));
+    quint32 ip = 0;
+    for (const auto &part : parts) {
+        bool ok = false;
+        const int octet = part.toInt(&ok);
+        if (!ok || octet < 0 || octet > 255)
+            return reject(QStringLiteral("The network address is not usable."));
+        ip = (ip << 8) | quint32(octet);
+    }
+    const quint32 high = (ip >> 24) & 0xff;
+    const quint32 next = (ip >> 16) & 0xff;
+    const bool privateLan = high == 10 || (high == 192 && next == 168) || (high == 172 && next >= 16 && next <= 31);
+    if (!privateLan)
+        return reject(QStringLiteral("Shares only scans a private local network."));
+    if (prefix < 22)
+        return reject(QStringLiteral("That network is too large to scan."));
+    if (prefix > 30)
+        return reject(QStringLiteral("That network has no other computers to scan."));
+
+    const quint32 count = 1u << (32 - prefix);
+    const quint32 network = ip & (0xffffffffu << (32 - prefix));
+    QStringList hosts;
+    hosts.reserve(int(count) - 2);
+    for (quint32 host = 1; host + 1 < count; ++host) {
+        const quint32 addressBits = network + host;
+        hosts.append(QStringLiteral("%1.%2.%3.%4")
+                         .arg((addressBits >> 24) & 255)
+                         .arg((addressBits >> 16) & 255)
+                         .arg((addressBits >> 8) & 255)
+                         .arg(addressBits & 255));
+    }
+    if (error)
+        error->clear();
+    return hosts;
+}
+
+namespace {
+
 struct SmbScanResult {
     QVariantList shares;
     QString error;
 };
 
-SmbScanResult scanSmbShares(const QString &host, const QString &user, const QString &password) {
+QString smbCredentialError(const QString &user, const QString &password) {
+    if (user.contains(u'\n') || user.contains(u'\r') || password.contains(u'\n') || password.contains(u'\r'))
+        return QStringLiteral("The SMB username and password cannot contain line breaks.");
+    if (user.isEmpty() && !password.isEmpty())
+        return QStringLiteral("Enter a username with the password, or leave both fields empty for guest access.");
+    return {};
+}
+
+int ipv4Prefix(quint32 mask) {
+    int bits = 0;
+    bool seenZero = false;
+    for (int bit = 31; bit >= 0; --bit) {
+        if (mask & (1u << bit)) {
+            if (seenZero)
+                return -1;
+            ++bits;
+        } else {
+            seenZero = true;
+        }
+    }
+    return bits;
+}
+
+QString ipv4Text(quint32 address) {
+    return QStringLiteral("%1.%2.%3.%4")
+        .arg((address >> 24) & 255)
+        .arg((address >> 16) & 255)
+        .arg((address >> 8) & 255)
+        .arg(address & 255);
+}
+
+quint32 ipv4Value(const QString &text) {
+    quint32 value = 0;
+    const auto parts = text.split('.');
+    if (parts.size() != 4)
+        return 0;
+    for (const auto &part : parts) {
+        bool ok = false;
+        const int octet = part.toInt(&ok);
+        if (!ok || octet < 0 || octet > 255)
+            return 0;
+        value = (value << 8) | quint32(octet);
+    }
+    return value;
+}
+
+QStringList planLanHosts(QString *error) {
+    QStringList hosts;
+    bool sawPrivate = false;
+    bool tooLarge = false;
+    ifaddrs *list = nullptr;
+    if (getifaddrs(&list) != 0) {
+        if (error)
+            *error = QStringLiteral("Could not read this computer's network addresses.");
+        return {};
+    }
+    for (auto *ifa = list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_netmask || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+            continue;
+        const auto address = ntohl(reinterpret_cast<sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr);
+        const auto mask = ntohl(reinterpret_cast<sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr);
+        const int prefix = ipv4Prefix(mask);
+        if (prefix < 0)
+            continue;
+        QString oneError;
+        const auto found = lanIpv4Hosts(ipv4Text(address), prefix, &oneError);
+        if (oneError.contains(QStringLiteral("private")))
+            continue;
+        sawPrivate = true;
+        if (found.isEmpty()) {
+            if (oneError.contains(QStringLiteral("too large")))
+                tooLarge = true;
+            continue;
+        }
+        for (const auto &host : found) {
+            if (!hosts.contains(host))
+                hosts.append(host);
+        }
+    }
+    freeifaddrs(list);
+    std::sort(hosts.begin(), hosts.end(), [](const QString &left, const QString &right) {
+        return ipv4Value(left) < ipv4Value(right);
+    });
+    if (hosts.isEmpty() && error) {
+        if (tooLarge)
+            *error = QStringLiteral("The local network is too large to scan.");
+        else if (sawPrivate)
+            *error = QStringLiteral("That network has no other computers to scan.");
+        else
+            *error = QStringLiteral("This computer is not on a private local network Shares can scan.");
+    } else if (error) {
+        error->clear();
+    }
+    return hosts;
+}
+
+QStringList hostsWithSmb(const QStringList &hosts) {
+    QStringList open;
+    constexpr int batch = 64;
+    constexpr int timeoutMs = 250;
+    for (int start = 0; start < hosts.size(); start += batch) {
+        const int count = qMin(batch, hosts.size() - start);
+        QVector<int> fds(count, -1);
+        QStringList batchHosts;
+        for (int i = 0; i < count; ++i) {
+            const auto host = hosts.at(start + i);
+            batchHosts.append(host);
+            const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0)
+                continue;
+            const int flags = ::fcntl(fd, F_GETFL, 0);
+            if (flags >= 0)
+                ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(445);
+            address.sin_addr.s_addr = htonl(ipv4Value(host));
+            const int rc = ::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+            if (rc == 0) {
+                open.append(host);
+                ::close(fd);
+                continue;
+            }
+            if (errno != EINPROGRESS) {
+                ::close(fd);
+                continue;
+            }
+            fds[i] = fd;
+        }
+        QDeadlineTimer deadline(timeoutMs);
+        while (!deadline.hasExpired()) {
+            QVector<pollfd> pfds;
+            QVector<int> index;
+            for (int i = 0; i < fds.size(); ++i) {
+                if (fds.at(i) < 0)
+                    continue;
+                pollfd pfd{};
+                pfd.fd = fds.at(i);
+                pfd.events = POLLOUT;
+                pfds.append(pfd);
+                index.append(i);
+            }
+            if (pfds.isEmpty())
+                break;
+            const int wait = int(qBound(qint64(0), deadline.remainingTime(), qint64(timeoutMs)));
+            const int ready = ::poll(pfds.data(), nfds_t(pfds.size()), wait);
+            if (ready == 0)
+                break;
+            for (int k = 0; k < pfds.size(); ++k) {
+                if (!(pfds.at(k).revents & (POLLOUT | POLLERR | POLLHUP)))
+                    continue;
+                int soerr = 0;
+                socklen_t len = sizeof(soerr);
+                ::getsockopt(pfds.at(k).fd, SOL_SOCKET, SO_ERROR, &soerr, &len);
+                if (soerr == 0 && (pfds.at(k).revents & POLLOUT))
+                    open.append(batchHosts.at(index.at(k)));
+                ::close(pfds.at(k).fd);
+                fds[index.at(k)] = -1;
+            }
+        }
+        for (int fd : fds) {
+            if (fd >= 0)
+                ::close(fd);
+        }
+    }
+    return open;
+}
+
+SmbScanResult scanSmbShares(const QString &host, const QString &user, const QString &password, int timeoutMs = 20000) {
     SmbScanResult result;
     const auto smbclient = QStandardPaths::findExecutable(QStringLiteral("smbclient"));
     if (smbclient.isEmpty()) {
@@ -105,7 +359,19 @@ SmbScanResult scanSmbShares(const QString &host, const QString &user, const QStr
         return result;
     }
 
-    QStringList args{QStringLiteral("-g"), QStringLiteral("-L"), QStringLiteral("//") + host};
+    // A private config keeps a broken local smb.conf from hiding the server's shares.
+    QTemporaryFile config;
+    if (!config.open()) {
+        result.error = QStringLiteral("Could not prepare the SMB client settings.");
+        return result;
+    }
+    config.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    const auto settings = QStringLiteral("[global]\nclient min protocol = SMB2\nclient max protocol = SMB3\n").toUtf8();
+    if (config.write(settings) != settings.size() || !config.flush()) {
+        result.error = QStringLiteral("Could not prepare the SMB client settings.");
+        return result;
+    }
+    QStringList args{QStringLiteral("-s"), config.fileName(), QStringLiteral("-g"), QStringLiteral("-L"), host};
     QTemporaryFile auth;
     if (!user.isEmpty() || !password.isEmpty()) {
         if (!auth.open()) {
@@ -130,7 +396,7 @@ SmbScanResult scanSmbShares(const QString &host, const QString &user, const QStr
         result.error = QStringLiteral("Could not start smbclient: ") + process.errorString();
         return result;
     }
-    if (!process.waitForFinished(20000)) {
+    if (!process.waitForFinished(timeoutMs)) {
         process.kill();
         process.waitForFinished(1000);
         result.error = QStringLiteral("Searching SMB shares timed out.");
@@ -139,16 +405,7 @@ SmbScanResult scanSmbShares(const QString &host, const QString &user, const QStr
 
     const auto output = QString::fromUtf8(process.readAllStandardOutput());
     const auto stderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
-    for (const auto &line : output.split('\n')) {
-        const auto fields = line.trimmed().split('|');
-        if (fields.size() < 2 || fields.at(0).compare(QStringLiteral("Disk"), Qt::CaseInsensitive) != 0)
-            continue;
-        const auto name = fields.at(1).trimmed();
-        if (name.isEmpty() || name.endsWith('$'))
-            continue;
-        result.shares.append(QVariantMap{{"name", name},
-                                         {"comment", fields.size() > 2 ? fields.mid(2).join('|').trimmed() : QString()}});
-    }
+    result.shares = parseSmbGrepableList(output);
     if (process.exitCode() != 0 && result.shares.isEmpty())
         result.error = stderrText.isEmpty() ? QStringLiteral("Could not list shares on %1.").arg(host) : stderrText;
     else if (result.shares.isEmpty())
@@ -2614,6 +2871,7 @@ void Backend::clearSmbShares() {
     ++m_smbWave;
     m_smbHost.clear();
     m_smbError.clear();
+    m_smbStatus.clear();
     m_smbShares.clear();
     m_smbScanning = false;
     emit smbChanged();
@@ -2625,20 +2883,16 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     if (!smbHostOk(host)) {
         m_smbError = QStringLiteral("Enter a host name or IPv4 address.");
         m_smbShares.clear();
+        m_smbStatus.clear();
         m_smbScanning = false;
         emit smbChanged();
         return;
     }
-    if (user.contains(u'\n') || user.contains(u'\r') || password.contains(u'\n') || password.contains(u'\r')) {
-        m_smbError = QStringLiteral("The SMB username and password cannot contain line breaks.");
+    const auto credentialError = smbCredentialError(user, password);
+    if (!credentialError.isEmpty()) {
+        m_smbError = credentialError;
         m_smbShares.clear();
-        m_smbScanning = false;
-        emit smbChanged();
-        return;
-    }
-    if (user.isEmpty() && !password.isEmpty()) {
-        m_smbError = QStringLiteral("Enter a username with the password, or leave both fields empty for guest access.");
-        m_smbShares.clear();
+        m_smbStatus.clear();
         m_smbScanning = false;
         emit smbChanged();
         return;
@@ -2648,12 +2902,18 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     m_smbHost = host;
     m_smbError.clear();
     m_smbShares.clear();
+    m_smbStatus = QStringLiteral("Looking for SMB shares…");
     m_smbScanning = true;
     emit smbChanged();
 
     QPointer<Backend> self(this);
     QThreadPool::globalInstance()->start([host, user, password, wave, self] {
-        const auto result = scanSmbShares(host, user, password);
+        auto result = scanSmbShares(host, user, password);
+        for (auto &share : result.shares) {
+            auto map = share.toMap();
+            map.insert(QStringLiteral("host"), host);
+            share = map;
+        }
         auto *app = QCoreApplication::instance();
         if (!app)
             return;
@@ -2663,6 +2923,7 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
                 if (!self || wave != self->m_smbWave)
                     return;
                 self->m_smbScanning = false;
+                self->m_smbStatus.clear();
                 self->m_smbShares = result.shares;
                 self->m_smbError = result.error;
                 emit self->smbChanged();
@@ -2671,17 +2932,91 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     });
 }
 
+void Backend::scanSmbNetwork(const QString &userName, const QString &password) {
+    const auto user = userName.trimmed();
+    const auto credentialError = smbCredentialError(user, password);
+    if (!credentialError.isEmpty()) {
+        m_smbError = credentialError;
+        m_smbShares.clear();
+        m_smbStatus.clear();
+        m_smbScanning = false;
+        emit smbChanged();
+        return;
+    }
+
+    const int wave = ++m_smbWave;
+    m_smbHost.clear();
+    m_smbError.clear();
+    m_smbShares.clear();
+    m_smbStatus = QStringLiteral("Scanning this computer's local network for SMB and Samba…");
+    m_smbScanning = true;
+    emit smbChanged();
+
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([user, password, wave, self] {
+        QString planError;
+        const auto hosts = planLanHosts(&planError);
+        QVariantList shares;
+        QString error = planError;
+        if (!hosts.isEmpty()) {
+            const auto servers = hostsWithSmb(hosts);
+            if (servers.isEmpty()) {
+                error = QStringLiteral("No SMB or Samba servers were found on the local network.");
+            } else {
+                for (const auto &host : servers) {
+                    const auto result = scanSmbShares(host, user, password, 8000);
+                    for (const auto &share : result.shares) {
+                        auto map = share.toMap();
+                        map.insert(QStringLiteral("host"), host);
+                        shares.append(map);
+                    }
+                }
+                if (shares.isEmpty())
+                    error = QStringLiteral("SMB servers answered, but none listed a visible share. Try a username and password.");
+                else
+                    error.clear();
+            }
+        }
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app,
+            [self, wave, shares, error] {
+                if (!self || wave != self->m_smbWave)
+                    return;
+                self->m_smbScanning = false;
+                self->m_smbStatus.clear();
+                self->m_smbShares = shares;
+                self->m_smbError = error;
+                emit self->smbChanged();
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 bool Backend::openSmbShare(int index) {
-    if (index < 0 || index >= m_smbShares.size() || m_smbHost.isEmpty())
+    if (index < 0 || index >= m_smbShares.size())
         return false;
-    const auto name = m_smbShares.at(index).toMap().value(QStringLiteral("name")).toString();
-    if (name.isEmpty())
+    const auto share = m_smbShares.at(index).toMap();
+    const auto name = share.value(QStringLiteral("name")).toString();
+    const auto host = share.value(QStringLiteral("host")).toString().isEmpty() ? m_smbHost
+                                                                                : share.value(QStringLiteral("host")).toString();
+    if (name.isEmpty() || host.isEmpty())
         return false;
     QUrl url;
     url.setScheme(QStringLiteral("smb"));
-    url.setHost(m_smbHost);
+    url.setHost(host);
     url.setPath(QStringLiteral("/") + name);
+    const auto location = url.toString(QUrl::FullyEncoded);
+    // This desktop has no smb:// handler, so Nautilus has to be asked directly.
+    const auto nautilus = QStandardPaths::findExecutable(QStringLiteral("nautilus"));
+    if (!nautilus.isEmpty() && QProcess::startDetached(nautilus, {QStringLiteral("--new-window"), location}))
+        return true;
     if (QDesktopServices::openUrl(url))
+        return true;
+    const auto gio = QStandardPaths::findExecutable(QStringLiteral("gio"));
+    if (!gio.isEmpty() && QProcess::startDetached(gio, {QStringLiteral("open"), location}))
         return true;
     m_smbError = QStringLiteral("Could not open the share. Install a file manager with SMB support (gvfs-smb on Arch).");
     emit smbChanged();

@@ -1117,6 +1117,78 @@ private slots:
         QCOMPARE(QString::fromUtf8(process.readAllStandardOutput()), QString("n0t-st0red\n"));
     }
 
+    void smbListKeepsDiskSharesAndSkipsWindowsAdminShares() {
+        const auto shares = parseSmbGrepableList(QStringLiteral(
+            "Anonymous login successful\n"
+            "Disk|photos|Pictures\n"
+            "Disk|zfsback1$|ZFS backup\n"
+            "Disk|C$|Default share\n"
+            "Disk|ADMIN$|Remote Admin\n"
+            "IPC|IPC$|IPC Service\n"
+            "Disk|Newmedia|\n"
+            "Disk|Media|Films|TV\n"
+            "SMB1 disabled -- no workgroup available\n"));
+        QCOMPARE(shares.size(), 4);
+        QCOMPARE(shares.at(0).toMap().value("name").toString(), QString("photos"));
+        QCOMPARE(shares.at(0).toMap().value("comment").toString(), QString("Pictures"));
+        QCOMPARE(shares.at(1).toMap().value("name").toString(), QString("zfsback1$"));
+        QCOMPARE(shares.at(2).toMap().value("name").toString(), QString("Newmedia"));
+        QCOMPARE(shares.at(2).toMap().value("comment").toString(), QString());
+        QCOMPARE(shares.at(3).toMap().value("name").toString(), QString("Media"));
+        QCOMPARE(shares.at(3).toMap().value("comment").toString(), QString("Films|TV"));
+    }
+
+    void lanScanListsAPrivateSubnetAndRefusesTheRest() {
+        QString error;
+        const auto lan = lanIpv4Hosts(QStringLiteral("192.168.1.20"), 24, &error);
+        QVERIFY(error.isEmpty());
+        QCOMPARE(lan.size(), 254);
+        QCOMPARE(lan.first(), QString("192.168.1.1"));
+        QCOMPARE(lan.last(), QString("192.168.1.254"));
+        QVERIFY(lan.contains(QString("192.168.1.20")));
+        QVERIFY(!lan.contains(QString("192.168.1.0")));
+        QVERIFY(!lan.contains(QString("192.168.1.255")));
+
+        const auto wide = lanIpv4Hosts(QStringLiteral("10.1.2.3"), 22, &error);
+        QVERIFY(error.isEmpty());
+        QCOMPARE(wide.size(), 1022);
+        QCOMPARE(wide.first(), QString("10.1.0.1"));
+        QCOMPARE(wide.last(), QString("10.1.3.254"));
+
+        QVERIFY(lanIpv4Hosts(QStringLiteral("192.168.0.1"), 16, &error).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("too large")));
+        QVERIFY(lanIpv4Hosts(QStringLiteral("8.8.8.8"), 24, &error).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("private")));
+        QVERIFY(lanIpv4Hosts(QStringLiteral("192.168.1.1"), 32, &error).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("no other computers")));
+    }
+
+    void smbDiscoveryRejectsABadRequestWithoutScanning() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        Backend backend(dir.path(), &commands);
+        backend.discoverSmbShares("not a host", "", "");
+        QCOMPARE(backend.smbError(), QString("Enter a host name or IPv4 address."));
+        QVERIFY(!backend.smbScanning());
+        QVERIFY(backend.smbShares().isEmpty());
+
+        backend.discoverSmbShares("files.example", "", "secret");
+        QCOMPARE(backend.smbError(), QString("Enter a username with the password, or leave both fields empty for guest access."));
+        QVERIFY(!backend.smbScanning());
+
+        backend.discoverSmbShares("files.example", "ada", "sec\nret");
+        QVERIFY(backend.smbError().contains("line break"));
+        QVERIFY(backend.smbShares().isEmpty());
+
+        backend.clearSmbShares();
+        QVERIFY(backend.smbError().isEmpty());
+
+        backend.scanSmbNetwork("ada", "sec\nret");
+        QVERIFY(backend.smbError().contains("line break"));
+        QVERIFY(!backend.smbScanning());
+        QVERIFY(backend.smbStatus().isEmpty());
+    }
+
     void themeFallsBack() {
         QTemporaryDir dir;
         Theme theme(dir.path());

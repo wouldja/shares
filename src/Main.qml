@@ -234,6 +234,16 @@ ApplicationWindow {
         smbHostField.forceActiveFocus()
     }
 
+    function findSmbShares() {
+        backend.discoverSmbShares(smbHostField.text, smbUserField.text, smbPasswordField.text)
+        smbPasswordField.text = ""
+    }
+
+    function scanSmbNetwork() {
+        backend.scanSmbNetwork(smbUserField.text, smbPasswordField.text)
+        smbPasswordField.text = ""
+    }
+
     function activateHost() {
         var naming = hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus || hostPasswordField.activeFocus
         if (naming && hostNameField.text.trim() !== "") {
@@ -797,7 +807,7 @@ ApplicationWindow {
                     "1 2 3 4    Samba, NFS, iSCSI, S3",
                     "J K    move through the list",
                     "/    filter",
-                    "H    computers on SSH or Tailscale",
+                    "H    computers, then Windows shares for SMB",
                     "X    disconnect. X again leaves unsaved edits",
                     "N    new share. Browse lists that computer",
                     "Ctrl+O    browse again while creating",
@@ -996,7 +1006,8 @@ ApplicationWindow {
         visible: win.hostsOpen
         anchors.centerIn: parent
         width: 460
-        height: Math.min(560, hostCol.implicitHeight + 36)
+        height: Math.min(win.height - 48, hostCol.implicitHeight + 36)
+        clip: true
         color: "#16161e"
         border.color: "#424247"
         Column {
@@ -1005,11 +1016,16 @@ ApplicationWindow {
             y: 18
             width: 424
             spacing: 8
-            Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-            Text { width: 424; wrapMode: Text.Wrap; text: "Enter a user, LAN IP or host name, and password to connect with SSH. Passwords are used for this connection only. Leave the password empty to use your SSH key. Tailscale peers can use Tailscale SSH when their password is empty."; color: "#7e8089"; font.family: win.font.family }
+            Column {
+                id: hostIntro
+                width: 424
+                spacing: 8
+                Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+                Text { width: 424; wrapMode: Text.Wrap; text: "Enter a user, LAN IP or host name, and password to connect with SSH. Passwords are used for this connection only. Leave the password empty to use your SSH key. Tailscale peers can use Tailscale SSH when their password is empty."; color: "#7e8089"; font.family: win.font.family }
+            }
             Flickable {
                 width: 424
-                height: 220
+                height: Math.max(96, Math.min(220, win.height - 80 - hostIntro.implicitHeight - hostForm.implicitHeight))
                 contentHeight: hostList.implicitHeight
                 clip: true
                 Column {
@@ -1144,66 +1160,72 @@ ApplicationWindow {
                     }
                 }
             }
-            TextField {
-                id: hostUserField
+            Column {
+                id: hostForm
                 width: 424
-                placeholderText: "SSH user"
-                placeholderTextColor: "#7e8089"
-                color: "#a1a3ad"
-                font.family: win.font.family
-                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-            }
-            TextField {
-                id: hostNameField
-                width: 424
-                placeholderText: "Host or Tailscale name"
-                placeholderTextColor: "#7e8089"
-                color: "#a1a3ad"
-                font.family: win.font.family
-                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-            }
-            TextField {
-                id: hostPortField
-                width: 424
-                placeholderText: "Port 22"
-                placeholderTextColor: "#7e8089"
-                color: "#a1a3ad"
-                font.family: win.font.family
-                text: "22"
-                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-            }
-            TextField {
-                id: hostPasswordField
-                width: 424
-                placeholderText: "SSH password (optional)"
-                placeholderTextColor: "#7e8089"
-                color: "#a1a3ad"
-                font.family: win.font.family
-                echoMode: TextInput.Password
-                inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
-                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-                onAccepted: win.connectTypedHost()
-            }
-            Text {
-                visible: backend.connecting
-                width: 424
-                wrapMode: Text.Wrap
-                text: backend.notice
-                color: "#a1a3ad"
-                font.family: win.font.family
-            }
-            Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 424; wrapMode: Text.Wrap; font.family: win.font.family }
-            Row {
                 spacing: 8
-                ActionButton { label: "Windows shares"; onActivated: win.openSmbBrowser() }
-                ActionButton {
-                    label: "Connect"
-                    primary: true
-                    onActivated: win.connectTypedHost()
+                TextField {
+                    id: hostUserField
+                    width: 424
+                    placeholderText: "SSH user"
+                    placeholderTextColor: "#7e8089"
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                    background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
                 }
-                ActionButton { label: "Disconnect"; visible: backend.remote; onActivated: win.requestDisconnect() }
-                ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: backend.trustHost() }
-                ActionButton { label: "Close"; onActivated: win.hostsOpen = false }
+                TextField {
+                    id: hostNameField
+                    width: 424
+                    placeholderText: "Host or Tailscale name"
+                    placeholderTextColor: "#7e8089"
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                    background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                }
+                TextField {
+                    id: hostPortField
+                    width: 424
+                    placeholderText: "Port 22"
+                    placeholderTextColor: "#7e8089"
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                    text: "22"
+                    background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                }
+                TextField {
+                    id: hostPasswordField
+                    width: 424
+                    placeholderText: "SSH password (optional)"
+                    placeholderTextColor: "#7e8089"
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                    echoMode: TextInput.Password
+                    inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                    background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                    onAccepted: win.connectTypedHost()
+                }
+                Text {
+                    visible: backend.connecting
+                    width: 424
+                    wrapMode: Text.Wrap
+                    text: backend.notice
+                    color: "#a1a3ad"
+                    font.family: win.font.family
+                }
+                Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 424; wrapMode: Text.Wrap; font.family: win.font.family }
+                Flow {
+                    width: 424
+                    spacing: 8
+                    ActionButton { label: "Windows shares"; onActivated: win.openSmbBrowser() }
+                    ActionButton {
+                        label: "Connect"
+                        primary: true
+                        onActivated: win.connectTypedHost()
+                    }
+                    ActionButton { label: "Disconnect"; visible: backend.remote; onActivated: win.requestDisconnect() }
+                    ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: backend.trustHost() }
+                    ActionButton { label: "Close"; onActivated: win.hostsOpen = false }
+                }
             }
         }
     }
@@ -1212,7 +1234,8 @@ ApplicationWindow {
         visible: win.smbOpen
         anchors.centerIn: parent
         width: 500
-        height: Math.min(680, smbCol.implicitHeight + 36)
+        height: Math.min(win.height - 48, smbCol.implicitHeight + 36)
+        clip: true
         color: "#16161e"
         border.color: "#424247"
         Column {
@@ -1222,7 +1245,7 @@ ApplicationWindow {
             width: 464
             spacing: 8
             Text { text: "Windows and SMB shares"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-            Text { width: 464; wrapMode: Text.Wrap; text: "Enter a server name or LAN IP. Credentials are used only to find shares; your file manager may ask for them again when opening one."; color: "#7e8089"; font.family: win.font.family }
+            Text { width: 464; wrapMode: Text.Wrap; text: "Enter a server, or scan this computer's local network for Windows and Samba. Credentials are optional and are not saved. Your file manager may ask for them again when you open a share."; color: "#7e8089"; font.family: win.font.family }
             TextField {
                 id: smbHostField
                 width: 464
@@ -1232,6 +1255,7 @@ ApplicationWindow {
                 font.family: win.font.family
                 inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                 background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                onAccepted: win.findSmbShares()
             }
             Row {
                 width: 464
@@ -1245,6 +1269,7 @@ ApplicationWindow {
                     font.family: win.font.family
                     inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                     background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                    onAccepted: win.findSmbShares()
                 }
                 TextField {
                     id: smbPasswordField
@@ -1256,24 +1281,28 @@ ApplicationWindow {
                     echoMode: TextInput.Password
                     inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                     background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                    onAccepted: win.findSmbShares()
                 }
             }
-            Row {
+            Flow {
+                width: 464
                 spacing: 8
                 ActionButton {
                     label: backend.smbScanning ? "Searching…" : "Find shares"
                     primary: true
-                    onActivated: {
-                        backend.discoverSmbShares(smbHostField.text, smbUserField.text, smbPasswordField.text)
-                        smbPasswordField.text = ""
-                    }
+                    onActivated: win.findSmbShares()
+                }
+                ActionButton {
+                    label: backend.smbScanning ? "Scanning…" : "Scan network"
+                    onActivated: win.scanSmbNetwork()
                 }
                 ActionButton { label: "Close"; onActivated: { backend.clearSmbShares(); smbOpen = false } }
             }
             Text {
-                visible: backend.smbScanning
+                visible: backend.smbStatus !== ""
                 width: 464
-                text: "Looking for SMB shares…"
+                wrapMode: Text.Wrap
+                text: backend.smbStatus
                 color: "#a1a3ad"
                 font.family: win.font.family
             }
@@ -1312,7 +1341,14 @@ ApplicationWindow {
                                     width: parent.width - openButton.width - 8
                                     anchors.verticalCenter: parent.verticalCenter
                                     Text { width: parent.width; text: modelData.name; color: "#bcbec8"; font.family: win.font.family; elide: Text.ElideRight }
-                                    Text { width: parent.width; text: modelData.comment; color: "#7e8089"; font.pixelSize: 10; font.family: win.font.family; elide: Text.ElideRight }
+                                    Text {
+                                        width: parent.width
+                                        text: modelData.host && modelData.comment ? modelData.host + " · " + modelData.comment : (modelData.host || modelData.comment || "")
+                                        color: "#7e8089"
+                                        font.pixelSize: 10
+                                        font.family: win.font.family
+                                        elide: Text.ElideRight
+                                    }
                                 }
                                 ActionButton { id: openButton; label: "Open"; onActivated: backend.openSmbShare(index) }
                             }
