@@ -33,6 +33,9 @@ ApplicationWindow {
     property bool leaveOpen: false
     property int hostCursor: 0
     property int hostFieldFocus: 0
+    property string peerEditId: ""
+    property string peerEditUser: ""
+    property string peerEditPassword: ""
     readonly property bool typing: filterField.activeFocus || nameField.activeFocus || pathField.activeFocus
         || editorField.activeFocus || globalField.activeFocus || importField.activeFocus
         || accountField.activeFocus || secretField.activeFocus || serviceField.activeFocus
@@ -219,7 +222,19 @@ ApplicationWindow {
         hostCursor = (hostCursor + delta + count) % count
     }
 
+    function notePeerEdit(id, user, password) {
+        peerEditId = id
+        peerEditUser = user
+        peerEditPassword = password
+    }
+
     function connectTypedHost() {
+        // The host box is a computer that is not in the list. An empty box
+        // means the highlighted row, including its Tailscale user and password.
+        if (hostNameField.text.trim() === "" && hostCursor > 0 && hostCursor < backend.hosts.length) {
+            activateHost()
+            return
+        }
         backend.addHost(hostUserField.text, hostNameField.text, parseInt(hostPortField.text), hostPasswordField.text)
         hostPasswordField.text = ""
     }
@@ -257,10 +272,16 @@ ApplicationWindow {
             requestDisconnect()
             return
         }
-        if (row.via === "tailscale")
-            backend.useHost(row.id)
-        else
-            backend.useHost(row.id, hostUserField.text)
+        if (row.via === "tailscale") {
+            if (peerEditId === row.id) {
+                backend.setHostLogin(row.id, peerEditUser, peerEditPassword)
+                backend.useHost(row.id, peerEditUser, peerEditPassword)
+            } else {
+                backend.useHost(row.id)
+            }
+            return
+        }
+        backend.useHost(row.id, hostUserField.text)
     }
 
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !typing; onActivated: helpOpen = !helpOpen }
@@ -890,7 +911,6 @@ ApplicationWindow {
         function onCreatePathChosen(path) { win.usePickedPath(path) }
         function onNeedsReady() { needsOpen = true }
         function onComputerReady() { hostsOpen = false }
-        function onHostChanged() { win.hostFieldFocus = 0 }
         function onBrowseChanged() { win.browseCursor = 0; if (browseFlick) browseFlick.contentY = 0 }
     }
 
@@ -1021,7 +1041,7 @@ ApplicationWindow {
                 width: 424
                 spacing: 8
                 Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-                Text { width: 424; wrapMode: Text.Wrap; text: "Enter a user, LAN IP or host name, and password to connect with SSH. Passwords are used for this connection only. Leave the password empty to use your SSH key. Tailscale peers can use Tailscale SSH when their password is empty."; color: "#7e8089"; font.family: win.font.family }
+                Text { width: 424; wrapMode: Text.Wrap; text: "Click a computer, or highlight one and press Connect. A Tailscale user and password belong to that computer. Leave the password empty for Tailscale SSH. The boxes below are for a computer that is not in the list. Passwords are not saved."; color: "#7e8089"; font.family: win.font.family }
             }
             Flickable {
                 width: 424
@@ -1080,8 +1100,14 @@ ApplicationWindow {
                             Component.onCompleted: fillLogin()
                             onModelDataChanged: fillLogin()
 
+                            MouseArea {
+                                z: 0
+                                anchors.fill: parent
+                                onClicked: hostRow.openThisHost()
+                            }
                             Column {
                                 id: tailCreds
+                                z: 1
                                 visible: modelData.via === "tailscale"
                                 anchors.left: parent.left
                                 anchors.right: parent.right
@@ -1103,10 +1129,6 @@ ApplicationWindow {
                                         font.pixelSize: 11
                                         font.family: win.font.family
                                     }
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: hostRow.openThisHost()
-                                    }
                                 }
                                 Row {
                                     width: parent.width
@@ -1120,9 +1142,17 @@ ApplicationWindow {
                                         font.family: win.font.family
                                         inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                                         background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-                                        onActiveFocusChanged: hostRow.noteHostFocus(activeFocus)
-                                        onTextEdited: backend.setHostLogin(modelData.id, text, peerPassword.text)
-                                        onAccepted: hostRow.openThisHost()
+                                        onActiveFocusChanged: {
+                                            hostRow.noteHostFocus(activeFocus)
+                                            if (activeFocus)
+                                                win.notePeerEdit(modelData.id, text, peerPassword.text)
+                                        }
+                                        onTextEdited: {
+                                            backend.setHostLogin(modelData.id, text, peerPassword.text)
+                                            win.notePeerEdit(modelData.id, text, peerPassword.text)
+                                        }
+                                        Keys.onReturnPressed: function(event) { hostRow.openThisHost(); event.accepted = true }
+                                        Keys.onEnterPressed: function(event) { hostRow.openThisHost(); event.accepted = true }
                                     }
                                     TextField {
                                         id: peerPassword
@@ -1134,13 +1164,22 @@ ApplicationWindow {
                                         font.family: win.font.family
                                         inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                                         background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-                                        onActiveFocusChanged: hostRow.noteHostFocus(activeFocus)
-                                        onTextEdited: backend.setHostLogin(modelData.id, peerUser.text, text)
-                                        onAccepted: hostRow.openThisHost()
+                                        onActiveFocusChanged: {
+                                            hostRow.noteHostFocus(activeFocus)
+                                            if (activeFocus)
+                                                win.notePeerEdit(modelData.id, peerUser.text, text)
+                                        }
+                                        onTextEdited: {
+                                            backend.setHostLogin(modelData.id, peerUser.text, text)
+                                            win.notePeerEdit(modelData.id, peerUser.text, text)
+                                        }
+                                        Keys.onReturnPressed: function(event) { hostRow.openThisHost(); event.accepted = true }
+                                        Keys.onEnterPressed: function(event) { hostRow.openThisHost(); event.accepted = true }
                                     }
                                 }
                             }
                             Column {
+                                z: 1
                                 visible: modelData.via !== "tailscale"
                                 anchors.left: parent.left
                                 anchors.right: parent.right
@@ -1151,11 +1190,7 @@ ApplicationWindow {
                                 Text { width: parent.width; elide: Text.ElideRight; text: modelData.name; color: "#bcbec8"; font.family: win.font.family }
                                 Text { width: parent.width; elide: Text.ElideRight; text: modelData.detail; color: "#7e8089"; font.pixelSize: 11; font.family: win.font.family }
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                visible: modelData.via !== "tailscale"
-                                onClicked: hostRow.openThisHost()
-                            }
+
                         }
                     }
                 }
@@ -1245,7 +1280,15 @@ ApplicationWindow {
             width: 464
             spacing: 8
             Text { text: "Windows and SMB shares"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-            Text { width: 464; wrapMode: Text.Wrap; text: "Enter a server, or scan this computer's local network for Windows and Samba. Credentials are optional and are not saved. Your file manager may ask for them again when you open a share."; color: "#7e8089"; font.family: win.font.family }
+            Text {
+                width: 464
+                wrapMode: Text.Wrap
+                text: backend.remote
+                      ? "Enter a server, or scan " + backend.hostTitle + "'s local network for Windows and Samba. The scan runs on that computer. Opening a share still uses this computer's file manager. Credentials are not saved."
+                      : "Enter a server, or scan this computer's local network for Windows and Samba. Credentials are optional and are not saved. Your file manager may ask for them again when you open a share."
+                color: "#7e8089"
+                font.family: win.font.family
+            }
             TextField {
                 id: smbHostField
                 width: 464

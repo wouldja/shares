@@ -17,6 +17,20 @@ QVariantList parseSmbGrepableList(const QString &output);
 // Addresses on one private subnet. A prefix shorter than /22 is refused.
 QStringList lanIpv4Hosts(const QString &address, int prefix, QString *error);
 
+// `ip -4 -o addr` output. Private subnets of /22 or longer become host addresses.
+// A Tailscale address and a network that is too large are left out.
+QStringList hostsFromIpAddr(const QString &output, bool remoteComputer, QString *error);
+
+// python3 -c script. Credentials and host names travel on stdin, not in this argv.
+QStringList remoteSmbListArgv();
+
+// stdout from that script. oneHost is a typed server; otherwise it was a network scan.
+struct RemoteSmbScan {
+    QVariantList shares;
+    QString error;
+};
+RemoteSmbScan parseRemoteSmbScan(const QString &output, bool oneHost, const QString &onlyHost);
+
 // The window's state. File edits stay in memory until Save. Save of the real
 // machine goes through pkexec; tests pass a temporary root and a fake runner
 // so nothing here touches the live Samba, NFS, or iSCSI configuration.

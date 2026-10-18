@@ -174,6 +174,231 @@ QStringList lanIpv4Hosts(const QString &address, int prefix, QString *error) {
     return hosts;
 }
 
+QStringList hostsFromIpAddr(const QString &output, bool remoteComputer, QString *error) {
+    const auto reject = [error](const QString &message) {
+        if (error)
+            *error = message;
+        return QStringList{};
+    };
+    static const QRegularExpression inetRe(QStringLiteral("\\binet\\s+(\\d{1,3}(?:\\.\\d{1,3}){3})/(\\d{1,2})\\b"));
+    QStringList hosts;
+    bool sawPrivate = false;
+    bool tooLarge = false;
+    auto it = inetRe.globalMatch(output);
+    while (it.hasNext()) {
+        const auto match = it.next();
+        bool prefixOk = false;
+        const int prefix = match.captured(2).toInt(&prefixOk);
+        if (!prefixOk)
+            continue;
+        QString oneError;
+        const auto found = lanIpv4Hosts(match.captured(1), prefix, &oneError);
+        if (oneError.contains(QStringLiteral("private")))
+            continue;
+        sawPrivate = true;
+        if (found.isEmpty()) {
+            if (oneError.contains(QStringLiteral("too large")))
+                tooLarge = true;
+            continue;
+        }
+        for (const auto &host : found) {
+            if (!hosts.contains(host))
+                hosts.append(host);
+        }
+    }
+    std::sort(hosts.begin(), hosts.end(), [](const QString &left, const QString &right) {
+        const auto leftParts = left.split('.');
+        const auto rightParts = right.split('.');
+        for (int i = 0; i < 4; ++i) {
+            const int a = leftParts.value(i).toInt();
+            const int b = rightParts.value(i).toInt();
+            if (a != b)
+                return a < b;
+        }
+        return false;
+    });
+    if (hosts.isEmpty()) {
+        if (tooLarge)
+            return reject(QStringLiteral("That network is too large to scan."));
+        if (sawPrivate)
+            return reject(QStringLiteral("That network has no other computers to scan."));
+        return reject(remoteComputer ? QStringLiteral("That computer is not on a private local network Shares can scan.")
+                                     : QStringLiteral("This computer is not on a private local network Shares can scan."));
+    }
+    if (error)
+        error->clear();
+    return hosts;
+}
+
+QStringList remoteSmbListArgv() {
+    // No single quotes. The remote shell receives this as one quoted argument,
+    // and the SMB password stays on stdin.
+    const auto script = QString::fromUtf8(R"PY(
+import concurrent.futures, os, re, shutil, socket, subprocess, sys, tempfile
+
+def is_ipv4(host):
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit():
+            return False
+        number = int(part)
+        if number < 0 or number > 255:
+            return False
+        if len(part) > 1 and part.startswith("0"):
+            return False
+    return True
+
+def allowed(host):
+    if is_ipv4(host):
+        return True
+    if ".." in host or host.endswith("."):
+        return False
+    return re.match(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$", host) is not None
+
+def port_open(host):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.25)
+    try:
+        sock.connect((host, 445))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+def reachable(host):
+    if not is_ipv4(host):
+        return host
+    if port_open(host):
+        return host
+    return ""
+
+lines = sys.stdin.read().split("\n")
+if len(lines) < 2:
+    print("BADINPUT")
+    raise SystemExit(0)
+user = lines[0]
+password = lines[1]
+hosts = []
+for host in lines[2:]:
+    if host and allowed(host) and host not in hosts:
+        hosts.append(host)
+smb = shutil.which("smbclient")
+if smb is None:
+    print("NOCLIENT")
+    raise SystemExit(0)
+chosen = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+    for host in pool.map(reachable, hosts):
+        if host:
+            chosen.append(host)
+if not chosen:
+    print("NOSERVER")
+    raise SystemExit(0)
+directory = tempfile.mkdtemp(prefix="shares-smb-")
+try:
+    os.chmod(directory, 0o700)
+    config = os.path.join(directory, "smb.conf")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write("[global]\nclient min protocol = SMB2\nclient max protocol = SMB3\n")
+    os.chmod(config, 0o600)
+    auth = ""
+    if user or password:
+        auth = os.path.join(directory, "auth")
+        with open(auth, "w", encoding="utf-8") as handle:
+            handle.write("username = %s\npassword = %s\n" % (user, password))
+        os.chmod(auth, 0o600)
+    for host in chosen:
+        args = [smb, "-s", config, "-g", "-L", host]
+        if auth:
+            args.extend(["-A", auth])
+        else:
+            args.append("-N")
+        print("HOST %s" % host)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=8)
+        except subprocess.TimeoutExpired:
+            print("FAIL timed out")
+            print("END")
+            continue
+        sys.stdout.write(result.stdout)
+        if result.stdout and not result.stdout.endswith("\n"):
+            print("")
+        if result.returncode != 0 and "Disk|" not in result.stdout:
+            err = (result.stderr or "").strip().replace("\n", " ")
+            print("FAIL %s" % (err or "could not list shares"))
+        print("END")
+finally:
+    shutil.rmtree(directory, ignore_errors=True)
+)PY");
+    return {QStringLiteral("python3"), QStringLiteral("-c"), QStringLiteral("'") + script + QStringLiteral("'")};
+}
+
+RemoteSmbScan parseRemoteSmbScan(const QString &output, bool oneHost, const QString &onlyHost) {
+    RemoteSmbScan result;
+    if (output.contains(QStringLiteral("\nNOCLIENT")) || output.startsWith(QStringLiteral("NOCLIENT"))) {
+        result.error = QStringLiteral("smbclient is not installed on that computer. Install the smbclient package.");
+        return result;
+    }
+    if (output.contains(QStringLiteral("BADINPUT"))) {
+        result.error = QStringLiteral("Could not scan that computer's network.");
+        return result;
+    }
+    if (output.contains(QStringLiteral("\nNOSERVER")) || output.startsWith(QStringLiteral("NOSERVER"))) {
+        result.error = oneHost ? QStringLiteral("Could not list shares on %1.").arg(onlyHost)
+                               : QStringLiteral("No SMB or Samba servers were found on that computer's local network.");
+        return result;
+    }
+    QString current;
+    QString block;
+    QString fail;
+    bool sawHost = false;
+    const auto flush = [&] {
+        if (current.isEmpty())
+            return;
+        sawHost = true;
+        const auto found = parseSmbGrepableList(block);
+        for (auto share : found) {
+            auto map = share.toMap();
+            map.insert(QStringLiteral("host"), current);
+            result.shares.append(map);
+        }
+        if (found.isEmpty() && !fail.isEmpty() && result.shares.isEmpty())
+            result.error = fail;
+        current.clear();
+        block.clear();
+        fail.clear();
+    };
+    for (const auto &line : output.split(QLatin1Char('\n'))) {
+        if (line.startsWith(QStringLiteral("HOST "))) {
+            flush();
+            current = line.mid(5).trimmed();
+            continue;
+        }
+        if (line == QStringLiteral("END")) {
+            flush();
+            continue;
+        }
+        if (line.startsWith(QStringLiteral("FAIL "))) {
+            fail = line.mid(5).trimmed();
+            continue;
+        }
+        if (!current.isEmpty())
+            block += line + QLatin1Char('\n');
+    }
+    flush();
+    if (!sawHost && result.error.isEmpty())
+        result.error = QStringLiteral("Could not scan that computer's network.");
+    else if (result.shares.isEmpty() && result.error.isEmpty())
+        result.error = oneHost ? QStringLiteral("No visible SMB shares were found on %1.").arg(onlyHost)
+                               : QStringLiteral("SMB servers answered, but none listed a visible share. Try a username and password.");
+    else if (!result.shares.isEmpty())
+        result.error.clear();
+    return result;
+}
+
 namespace {
 
 struct SmbScanResult {
@@ -2877,6 +3102,29 @@ void Backend::clearSmbShares() {
     emit smbChanged();
 }
 
+RemoteSmbScan listRemoteSmb(RemoteLink *link, const QStringList &hosts, const QString &user, const QString &password, bool oneHost,
+                            int timeoutMs) {
+    RemoteSmbScan result;
+    if (!link) {
+        result.error = QStringLiteral("Could not scan that computer's network.");
+        return result;
+    }
+    QString input = user + QStringLiteral("\n") + password + QStringLiteral("\n");
+    for (const auto &host : hosts)
+        input += host + QStringLiteral("\n");
+    const auto ran = link->exec(remoteSmbListArgv(), input, timeoutMs);
+    const auto err = ran.err;
+    if (ran.code == 127 || (err.contains(QStringLiteral("python3")) && err.contains(QStringLiteral("not found")))) {
+        result.error = QStringLiteral("python3 is not installed on that computer.");
+        return result;
+    }
+    if (ran.code != 0 && ran.out.trimmed().isEmpty()) {
+        result.error = err.trimmed().isEmpty() ? QStringLiteral("Could not scan that computer's network.") : err.trimmed();
+        return result;
+    }
+    return parseRemoteSmbScan(ran.out, oneHost, hosts.value(0));
+}
+
 void Backend::discoverSmbShares(const QString &hostName, const QString &userName, const QString &password) {
     const auto host = hostName.trimmed();
     const auto user = userName.trimmed();
@@ -2902,13 +3150,24 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     m_smbHost = host;
     m_smbError.clear();
     m_smbShares.clear();
-    m_smbStatus = QStringLiteral("Looking for SMB shares…");
+    m_smbStatus = remote() ? QStringLiteral("Looking for SMB shares from %1…").arg(m_hostTitle)
+                           : QStringLiteral("Looking for SMB shares…");
     m_smbScanning = true;
     emit smbChanged();
 
     QPointer<Backend> self(this);
-    QThreadPool::globalInstance()->start([host, user, password, wave, self] {
-        auto result = scanSmbShares(host, user, password);
+    const bool onRemote = remote() && m_link;
+    auto kept = m_linkShared;
+    RemoteLink *link = m_link;
+    QThreadPool::globalInstance()->start([host, user, password, wave, self, onRemote, kept, link] {
+        Q_UNUSED(kept);
+        auto result = onRemote ? listRemoteSmb(link, {host}, user, password, true, 20000) : [&] {
+            auto local = scanSmbShares(host, user, password);
+            RemoteSmbScan wrapped;
+            wrapped.shares = local.shares;
+            wrapped.error = local.error;
+            return wrapped;
+        }();
         for (auto &share : result.shares) {
             auto map = share.toMap();
             map.insert(QStringLiteral("host"), host);
@@ -2948,12 +3207,49 @@ void Backend::scanSmbNetwork(const QString &userName, const QString &password) {
     m_smbHost.clear();
     m_smbError.clear();
     m_smbShares.clear();
-    m_smbStatus = QStringLiteral("Scanning this computer's local network for SMB and Samba…");
+    const bool onRemote = remote() && m_link;
+    m_smbStatus = onRemote ? QStringLiteral("Scanning %1's local network for SMB and Samba…").arg(m_hostTitle)
+                           : QStringLiteral("Scanning this computer's local network for SMB and Samba…");
     m_smbScanning = true;
     emit smbChanged();
 
     QPointer<Backend> self(this);
-    QThreadPool::globalInstance()->start([user, password, wave, self] {
+    auto kept = m_linkShared;
+    RemoteLink *link = m_link;
+    QThreadPool::globalInstance()->start([user, password, wave, self, onRemote, kept, link] {
+        Q_UNUSED(kept);
+        if (onRemote) {
+            QString planError;
+            QVariantList shares;
+            const auto addr = link->exec({QStringLiteral("ip"), QStringLiteral("-4"), QStringLiteral("-o"),
+                                           QStringLiteral("addr"), QStringLiteral("show"), QStringLiteral("scope"),
+                                           QStringLiteral("global")},
+                                          {}, 8000);
+            if (addr.code != 0)
+                planError = QStringLiteral("Could not read that computer's network addresses.");
+            const auto hosts = planError.isEmpty() ? hostsFromIpAddr(addr.out, true, &planError) : QStringList{};
+            if (planError.isEmpty()) {
+                const auto listed = listRemoteSmb(link, hosts, user, password, false, 120000);
+                shares = listed.shares;
+                planError = listed.error;
+            }
+            auto *app = QCoreApplication::instance();
+            if (!app)
+                return;
+            QMetaObject::invokeMethod(
+                app,
+                [self, wave, shares, planError] {
+                    if (!self || wave != self->m_smbWave)
+                        return;
+                    self->m_smbScanning = false;
+                    self->m_smbStatus.clear();
+                    self->m_smbShares = shares;
+                    self->m_smbError = planError;
+                    emit self->smbChanged();
+                },
+                Qt::QueuedConnection);
+            return;
+        }
         QString planError;
         const auto hosts = planLanHosts(&planError);
         QVariantList shares;

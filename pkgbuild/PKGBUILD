@@ -1,5 +1,5 @@
 pkgname=shares
-pkgver=0.2.5
+pkgver=0.2.6
 pkgrel=1
 pkgdesc='Publish folders over Samba, NFS, iSCSI, and S3'
 arch=('x86_64' 'aarch64')

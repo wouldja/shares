@@ -1189,6 +1189,81 @@ private slots:
         QVERIFY(backend.smbStatus().isEmpty());
     }
 
+    void remoteLanScanUsesTheConnectedComputer() {
+        QString error;
+        const auto hosts = hostsFromIpAddr(QStringLiteral(
+            "2: enp6s0    inet 192.168.1.20/24 brd 192.168.1.255 scope global enp6s0\n"
+            "3: tailscale0    inet 100.120.22.51/32 scope global tailscale0\n"
+            "4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n"),
+                                           true, &error);
+        QVERIFY(error.isEmpty());
+        QCOMPARE(hosts.size(), 254);
+        QCOMPARE(hosts.first(), QString("192.168.1.1"));
+        QCOMPARE(hosts.last(), QString("192.168.1.254"));
+        QVERIFY(!hosts.contains(QString("100.120.22.51")));
+        QVERIFY(!hosts.contains(QString("172.17.0.1")));
+
+        QVERIFY(hostsFromIpAddr(QStringLiteral("2: eth0 inet 8.8.8.8/24 scope global eth0\n"), true, &error).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("not on a private")));
+        QVERIFY(hostsFromIpAddr(QStringLiteral("2: eth0 inet 10.0.0.1/16 scope global eth0\n"), true, &error).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("too large")));
+
+        const auto parsed = parseRemoteSmbScan(QStringLiteral(
+            "HOST 192.168.1.5\n"
+            "Disk|photos|Pictures\n"
+            "Disk|C$|Default share\n"
+            "END\n"
+            "HOST 192.168.1.9\n"
+            "FAIL NT_STATUS_ACCESS_DENIED\n"
+            "END\n"),
+                                               false, {});
+        QCOMPARE(parsed.shares.size(), 1);
+        QCOMPARE(parsed.shares.at(0).toMap().value("name").toString(), QString("photos"));
+        QCOMPARE(parsed.shares.at(0).toMap().value("host").toString(), QString("192.168.1.5"));
+        QVERIFY(parsed.error.isEmpty());
+
+        const auto denied = parseRemoteSmbScan(QStringLiteral("HOST 192.168.1.9\nFAIL NT_STATUS_ACCESS_DENIED\nEND\n"), true,
+                                               QStringLiteral("192.168.1.9"));
+        QCOMPARE(denied.error, QString("NT_STATUS_ACCESS_DENIED"));
+        QVERIFY(denied.shares.isEmpty());
+        QCOMPARE(parseRemoteSmbScan(QStringLiteral("NOCLIENT\n"), false, {}).error,
+                 QString("smbclient is not installed on that computer. Install the smbclient package."));
+        QVERIFY(remoteSmbListArgv().join(' ').startsWith("python3 -c '"));
+        QVERIFY(!remoteSmbListArgv().join(' ').contains("secret"));
+
+        QTemporaryDir dir;
+        FakeCommands commands;
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        link.exact.insert("ip -4 -o addr show scope global",
+                          {0, "2: enp6s0 inet 192.168.1.20/24 brd 192.168.1.255 scope global enp6s0\n", {}, false});
+        link.exact.insert(remoteSmbListArgv().join(' '),
+                          {0, "HOST 192.168.1.5\nDisk|photos|Pictures\nEND\n", {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        QVERIFY(backend.addHost("root", "indx.example", 22));
+        QCOMPARE(backend.hostTitle(), QString("indx"));
+        QVERIFY(backend.remote());
+
+        QSignalSpy spy(&backend, &Backend::smbChanged);
+        backend.scanSmbNetwork("ada", "secret");
+        QTRY_VERIFY(!backend.smbScanning());
+        QCOMPARE(backend.smbShares().size(), 1);
+        QCOMPARE(backend.smbShares().at(0).toMap().value("name").toString(), QString("photos"));
+        QCOMPARE(backend.smbShares().at(0).toMap().value("host").toString(), QString("192.168.1.5"));
+        QVERIFY(backend.smbError().isEmpty());
+        int listCall = -1;
+        for (int i = 0; i < link.calls.size(); ++i) {
+            if (link.calls.at(i).value(0) == "python3")
+                listCall = i;
+        }
+        QVERIFY(listCall >= 0);
+        QVERIFY(link.inputs.at(listCall).startsWith("ada\nsecret\n"));
+        QVERIFY(link.inputs.at(listCall).contains("192.168.1.5\n"));
+        QVERIFY(!link.calls.at(listCall).join(' ').contains("secret"));
+        QVERIFY(spy.count() >= 1);
+    }
+
     void themeFallsBack() {
         QTemporaryDir dir;
         Theme theme(dir.path());
