@@ -1,5 +1,5 @@
 pkgname=shares
-pkgver=0.2.6
+pkgver=0.2.7
 pkgrel=1
 pkgdesc='Publish folders over Samba, NFS, iSCSI, and S3'
 arch=('x86_64' 'aarch64')
@@ -27,6 +27,7 @@ build() {
 package() {
   cd "$startdir/.."
   install -Dm755 build/shares "$pkgdir/usr/bin/shares"
+  install -Dm755 build/apply/shares-apply "$pkgdir/usr/bin/shares-apply"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$startdir/shares.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/shares.svg"
   install -Dm644 "$startdir/shares.desktop" "$pkgdir/usr/share/applications/shares.desktop"

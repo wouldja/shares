@@ -46,6 +46,9 @@ struct Plan {
     QVector<QPair<QString, QString>> files;
     QVector<PlannedCommand> commands;
     QString error;
+    // Present only for a local root save. It is not part of the remote plan.
+    // shares-apply rebuilds the files and commands from this model.
+    QByteArray model;
 };
 
 struct Account {
@@ -64,6 +67,9 @@ struct OsProfile {
     QString nfsPackage = QStringLiteral("nfs-utils");
     QString iscsiPackage = QStringLiteral("targetcli-fb");
 };
+
+OsProfile profileForRelease(const QString &id, const QString &idLike);
+OsProfile profileOfThisMachine();
 
 class Library {
 public:
@@ -115,11 +121,20 @@ private:
 };
 
 bool loopbackOrigin(const QString &url);
+bool fileAllowed(const QString &relativePath);
+bool alreadyExistsMessage(const QString &message);
 bool applyPlan(const QString &root, const Plan &plan, Commands *commands, QString *error, QString *output = nullptr);
+bool applyOperation(const QString &root, const QByteArray &json, Commands *commands, QString *error, QString *output = nullptr);
 QByteArray planToJson(const Plan &plan);
 Plan planFromJson(const QByteArray &bytes, bool *ok = nullptr);
+QByteArray saveOperation(const SambaConfig &samba, const QVector<NfsExport> &nfs, const IscsiConfig &iscsi,
+                         const QString &rustfsEndpoint = {});
+QByteArray passwordOperation(const QString &action, const QString &user, const QString &password);
+QByteArray s3BucketOperation(const QString &backend, const QString &action, const QString &name, const QString &endpoint);
+QByteArray s3AccessOperation(const QString &backend, const QString &action, const QString &name, const QString &secret);
 QStringList s3BucketArgs(const QString &backend, const QString &action, const QString &name, const QString &endpoint, QString *error);
-QStringList s3AccessArgs(const QString &backend, const QString &action, const QString &name, const QString &secret, QString *error);
+QStringList s3AccessArgs(const QString &backend, const QString &action, const QString &name, const QString &secret, QString *error,
+                         QString *input = nullptr);
 QVector<S3Bucket> parseBucketList(const QString &backend, const QString &text);
 QStringList parseAccessList(const QString &backend, const QString &text);
 QStringList parseSessions(const QString &text);

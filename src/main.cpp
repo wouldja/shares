@@ -15,20 +15,19 @@
 #include "store.h"
 #include "theme.h"
 
-// Root-only half of a save. The graphical app sends a plan on stdin. This
-// process re-checks every path and command before it writes or runs anything.
+// Root-only half of a save. The graphical app sends a model on stdin. This
+// process rebuilds the plan from the files on disk, then re-checks every path
+// and command before it writes or runs anything.
 static int privilegedMain(int argc, char *argv[]) {
     QCoreApplication app(argc, argv);
     QFile in;
     if (!in.open(stdin, QIODevice::ReadOnly))
         return 1;
-    bool ok = false;
-    const auto plan = planFromJson(in.readAll(), &ok);
     QString error;
     QString output;
     Commands commands;
-    if (!ok || !applyPlan(QStringLiteral("/"), plan, &commands, &error, &output)) {
-        fprintf(stderr, "%s\n", qPrintable(error.isEmpty() ? plan.error : error));
+    if (!applyOperation(QStringLiteral("/"), in.readAll(), &commands, &error, &output)) {
+        fprintf(stderr, "%s\n", qPrintable(error));
         return 1;
     }
     fprintf(stdout, "%s", qPrintable(output));
@@ -49,7 +48,7 @@ int main(int argc, char *argv[]) {
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("shares");
-    app.setApplicationVersion("0.2.6");
+    app.setApplicationVersion("0.2.7");
 
     // Matches the window to shares.desktop, so the compositor (Wayland app_id)
     // and the launcher pick up the installed icon.

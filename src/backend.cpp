@@ -712,7 +712,11 @@ bool fillAdvanced(const QStringList &lines, QMap<QString, QString> *extra, QStri
         }
         const auto key = line.left(eq).trimmed().toLower();
         const auto value = line.mid(eq + 1).trimmed();
-        if (key == "include" || key.contains('\n') || value.contains('\n')) {
+        if (dangerousSambaKey(key)) {
+            *error = "Shares will not write a Samba key that runs a program.";
+            return false;
+        }
+        if (key.contains('\n') || value.contains('\n') || value.contains('\r')) {
             *error = "An advanced key cannot include another file.";
             return false;
         }
@@ -819,13 +823,28 @@ void Backend::reload() {
     }
     QString pullError;
     if (m_mirror && m_link) {
-        if (!pullRemoteFiles(m_link, m_mirror->path(), &pullError)) {
+        if (!pullRemoteFiles(m_link, m_mirror->path(), &pullError, m_sudoPassword)) {
             // Keep going with whatever was copied so the window still opens.
         }
         m_library.setRoot(m_mirror->path());
         m_root = m_mirror->path();
     }
+    noteSudoRead(pullError);
     finishReload(wave, pullError);
+}
+
+void Backend::noteSudoRead(const QString &pullError) {
+    if (m_sudoPassword.isEmpty())
+        return;
+    if (pullError.isEmpty()) {
+        m_sudoPasswordNeeded = false;
+        return;
+    }
+    if (pullError == QStringLiteral("That sudo password was not accepted.")) {
+        m_sudoPassword.clear();
+        m_sudoPasswordNeeded = true;
+        m_canInstall = false;
+    }
 }
 
 void Backend::finishReload(int wave, const QString &pullError) {
@@ -1731,6 +1750,7 @@ bool Backend::create(const QString &name, const QString &path) {
         }
         Plan plan;
         plan.commands.append({args, {}});
+        plan.model = s3BucketOperation(backend, QStringLiteral("create"), trimmedName, m_library.rustfsEndpoint);
         if (!runPlan(plan))
             return false;
         m_s3.buckets.append({backend, trimmedName, {}});
@@ -1849,6 +1869,7 @@ void Backend::removeSelected() {
         }
         Plan plan;
         plan.commands.append({args, {}});
+        plan.model = s3BucketOperation(bucket.backend, QStringLiteral("delete"), bucket.name, m_library.rustfsEndpoint);
         if (!runPlan(plan))
             return;
         m_s3.buckets.removeAt(index);
@@ -1962,7 +1983,8 @@ void Backend::clearError() { setError({}); }
 bool Backend::save() {
     if (!m_dirty)
         return true;
-    const auto plan = m_library.plan(m_samba, m_nfs, m_iscsi);
+    auto plan = m_library.plan(m_samba, m_nfs, m_iscsi);
+    plan.model = saveOperation(m_samba, m_nfs, m_iscsi, m_library.rustfsEndpoint);
     if (!runPlan(plan))
         return false;
     m_library.samba = m_samba;
@@ -2129,7 +2151,7 @@ bool Backend::applyEditor(const QString &text) {
             device->kind = kind;
         }
         if (form.pairs.contains("size") && device) {
-            static const QRegularExpression size("^$|^[0-9]+[MGT]?$");
+            static const QRegularExpression size("^$|^[0-9]+[KMGT]?$");
             if (!size.match(form.pairs.value("size")).hasMatch()) {
                 setError(QStringLiteral("Size looks like 1G."));
                 return false;
@@ -2186,7 +2208,7 @@ bool Backend::applyEditor(const QString &text) {
                 if (parts.size() > 2)
                     acl.password = parts.at(2);
                 if ((!acl.userid.isEmpty() && !tokenOk(acl.userid)) || (!acl.password.isEmpty() && !tokenOk(acl.password))) {
-                    setError(QStringLiteral("CHAP uses letters and numbers so it can be sent without a shell."));
+                    setError(QStringLiteral("CHAP uses letters and numbers. A space or a line break is refused."));
                     return false;
                 }
                 acls.append(acl);
@@ -2282,6 +2304,10 @@ bool Backend::importText(const QString &text) {
         return true;
     }
     if (m_protocol == 0) {
+        if (sambaTextHasDangerousKey(text)) {
+            setError(QStringLiteral("Shares will not write a Samba key that runs a program."));
+            return false;
+        }
         auto parsed = parseSamba(text);
         static const QRegularExpression global("^\\s*\\[global\\]", QRegularExpression::CaseInsensitiveOption | QRegularExpression::MultilineOption);
         if (!global.match(text).hasMatch())
@@ -2347,6 +2373,7 @@ bool Backend::setSambaPassword(const QString &user, const QString &password) {
     // smbpasswd reads the password twice on stdin. It is not a command argument,
     // and the Linux login password is left alone.
     plan.commands.append({{"smbpasswd", "-s", "-a", name}, password + "\n" + password + "\n"});
+    plan.model = passwordOperation(QStringLiteral("add"), name, password);
     if (!runPlan(plan))
         return false;
     bool found = false;
@@ -2371,6 +2398,7 @@ bool Backend::removeSambaPassword(const QString &user) {
     }
     Plan plan;
     plan.commands.append({{"smbpasswd", "-x", name}, {}});
+    plan.model = passwordOperation(QStringLiteral("remove"), name, {});
     if (!runPlan(plan))
         return false;
     for (auto &account : m_users) {
@@ -2388,13 +2416,15 @@ bool Backend::createAccess(const QString &backend, const QString &name, const QS
         return false;
     }
     QString error;
-    const auto args = s3AccessArgs(which, "create", name.trimmed(), secret, &error);
+    QString input;
+    const auto args = s3AccessArgs(which, "create", name.trimmed(), secret, &error, &input);
     if (args.isEmpty()) {
         setError(error);
         return false;
     }
     Plan plan;
-    plan.commands.append({args, {}});
+    plan.commands.append({args, input});
+    plan.model = s3AccessOperation(which, QStringLiteral("create"), name.trimmed(), secret);
     QString output;
     if (!runPlan(plan, &output))
         return false;
@@ -2420,6 +2450,7 @@ bool Backend::removeAccess(const QString &backend, const QString &name) {
     }
     Plan plan;
     plan.commands.append({args, {}});
+    plan.model = s3AccessOperation(which, QStringLiteral("delete"), account, {});
     if (!runPlan(plan))
         return false;
     for (int i = m_s3.access.size() - 1; i >= 0; --i) {
@@ -2443,7 +2474,7 @@ bool Backend::runPlan(const Plan &plan, QString *output) {
             return false;
         }
         QString error;
-        if (!applyRemotePlan(m_link, helper.readAll(), planToJson(plan), &error, output)) {
+        if (!applyRemotePlan(m_link, helper.readAll(), planToJson(plan), &error, output, m_sudoPassword)) {
             setError(error.isEmpty() ? QStringLiteral("The change was not applied.") : error);
             return false;
         }
@@ -2463,19 +2494,29 @@ bool Backend::runPlan(const Plan &plan, QString *output) {
 }
 
 bool Backend::commitWithPkexec(const Plan &plan, QString *error, QString *output) {
+    if (plan.model.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("The request was not valid.");
+        return false;
+    }
     if (QStandardPaths::findExecutable(QStringLiteral("pkexec")).isEmpty()) {
         if (error)
             *error = QStringLiteral("pkexec is not installed");
         return false;
     }
+    // The policy allows only the installed helper. It rebuilds the plan from
+    // the model, so a file body from this process is not applied as root.
+    auto helper = QCoreApplication::applicationDirPath() + QStringLiteral("/shares-apply");
+    if (!QFileInfo(helper).isExecutable())
+        helper = QStringLiteral("/usr/bin/shares-apply");
     QProcess process;
-    process.start(QStringLiteral("pkexec"), {QCoreApplication::applicationFilePath(), QStringLiteral("--privileged")});
+    process.start(QStringLiteral("pkexec"), {helper});
     if (!process.waitForStarted(5000)) {
         if (error)
             *error = QStringLiteral("Could not start pkexec. ") + process.errorString();
         return false;
     }
-    process.write(planToJson(plan));
+    process.write(plan.model);
     process.closeWriteChannel();
     // The polkit dialog is a separate process. This window waits for it.
     if (!process.waitForFinished(120000)) {
@@ -2706,6 +2747,8 @@ bool Backend::beginConnect(const RemoteHost &host) {
     m_notice = QStringLiteral("Reading the share files.");
     m_canInstall = false;
     m_canTrustHost = false;
+    m_sudoPassword.clear();
+    m_sudoPasswordNeeded = false;
     emit hostChanged();
     touch();
 
@@ -2740,13 +2783,9 @@ bool Backend::beginConnect(const RemoteHost &host) {
         if (result.need.connected) {
             const auto pulled = tried.first->exec(remoteBundleArgv(), {}, 20000);
             const auto message = pulled.err + pulled.out;
-            if (pulled.code != 0) {
-                if (message.contains(QStringLiteral("a password is required")) || message.contains(QStringLiteral("sudo")))
-                    result.pullError = QStringLiteral("The SSH user needs passwordless sudo to read the share files.");
-                else
-                    result.pullError = message.trimmed().isEmpty() ? QStringLiteral("Could not read the share files.")
-                                                                   : message.trimmed();
-            } else {
+            if (pulled.code != 0)
+                result.pullError = shareReadError(message, false);
+            else {
                 result.haveBundle = true;
                 result.bundle = pulled.out.toUtf8();
             }
@@ -2790,6 +2829,7 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
         m_notice = m_library.notice;
         m_canTrustHost = result.need.hostKeyDenied;
         m_canInstall = false;
+        m_sudoPasswordNeeded = false;
         m_needsText.clear();
         setError(result.need.error);
         emit hostChanged();
@@ -2818,6 +2858,7 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
     m_hostTitle = result.host.name.isEmpty() ? result.host.host : result.host.name;
     m_neededPackages = result.need.packages;
     m_canInstall = result.need.sudo && !result.need.packages.isEmpty();
+    m_sudoPasswordNeeded = !result.need.sudo;
     m_canTrustHost = false;
     if (!result.need.sudo)
         m_needsText = result.need.error + QStringLiteral("\n\n") + result.need.command;
@@ -2841,19 +2882,17 @@ void Backend::scheduleRemoteReload(int wave) {
         finishReload(wave, QStringLiteral("Could not read the share files."));
         return;
     }
+    const auto password = m_sudoPassword;
     QPointer<Backend> self(this);
-    QThreadPool::globalInstance()->start([link, wave, self] {
+    QThreadPool::globalInstance()->start([link, wave, self, password] {
         QString pullError;
         QByteArray bundle;
         bool haveBundle = false;
-        const auto result = link->exec(remoteBundleArgv(), {}, 20000);
+        const auto result = link->exec(sudoCommand(remoteBundleArgv(), password), sudoStdin(password, {}), 20000);
         const auto message = result.err + result.out;
-        if (result.code != 0) {
-            if (message.contains(QStringLiteral("a password is required")) || message.contains(QStringLiteral("sudo")))
-                pullError = QStringLiteral("The SSH user needs passwordless sudo to read the share files.");
-            else
-                pullError = message.trimmed().isEmpty() ? QStringLiteral("Could not read the share files.") : message.trimmed();
-        } else {
+        if (result.code != 0)
+            pullError = shareReadError(message, !password.isEmpty());
+        else {
             haveBundle = true;
             bundle = result.out.toUtf8();
         }
@@ -2869,7 +2908,9 @@ void Backend::scheduleRemoteReload(int wave) {
                     writeRemoteBundle(bundle, self->m_mirror->path(), &error);
                 self->m_library.setRoot(self->m_mirror->path());
                 self->m_root = self->m_mirror->path();
+                self->noteSudoRead(error);
                 self->finishReload(wave, error);
+                emit self->hostChanged();
             },
             Qt::QueuedConnection);
     });
@@ -2890,6 +2931,8 @@ void Backend::useLocal() {
     m_root = m_appRoot;
     m_hostTitle = QStringLiteral("This computer");
     m_pendingPassword.clear();
+    m_sudoPassword.clear();
+    m_sudoPasswordNeeded = false;
     m_needsText.clear();
     m_neededPackages.clear();
     m_canInstall = false;
@@ -2924,6 +2967,8 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     auto target = host;
     if (target.user.isEmpty())
         target.user = localUser();
+    m_sudoPassword.clear();
+    m_sudoPasswordNeeded = false;
     if (!m_injectedLink) {
         if (!remoteTargetOk(target.user, target.host, target.port)) {
             setError(QStringLiteral("That computer needs a user and a plain host name."));
@@ -2945,6 +2990,7 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     if (!need.connected) {
         m_canTrustHost = need.hostKeyDenied;
         m_canInstall = false;
+        m_sudoPasswordNeeded = false;
         m_needsText.clear();
         setError(need.error);
         emit hostChanged();
@@ -2963,6 +3009,7 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     m_hostTitle = target.name.isEmpty() ? target.host : target.name;
     m_neededPackages = need.packages;
     m_canInstall = need.sudo && !need.packages.isEmpty();
+    m_sudoPasswordNeeded = !need.sudo;
     m_canTrustHost = false;
     if (!need.sudo)
         m_needsText = need.error + QStringLiteral("\n\n") + need.command;
@@ -3342,32 +3389,55 @@ bool Backend::installNeeds() {
         return false;
     }
     QString error;
-    if (!installRemotePackages(m_link, m_remoteProfile, m_neededPackages, &error)) {
+    if (!installRemotePackages(m_link, m_remoteProfile, m_neededPackages, &error, m_sudoPassword)) {
         setError(error);
         return false;
     }
     const auto need = probeRemote(m_link);
+    const bool sudoReady = need.sudo || !m_sudoPassword.isEmpty();
     m_remoteProfile = need.profile;
     m_library.setProfile(need.profile);
     m_neededPackages = need.packages;
-    m_canInstall = need.connected && need.sudo && !need.packages.isEmpty();
+    m_canInstall = need.connected && sudoReady && !need.packages.isEmpty();
+    m_sudoPasswordNeeded = need.connected && !sudoReady;
     if (!need.connected)
         m_needsText = need.error;
-    else if (!need.sudo)
+    else if (!sudoReady)
         m_needsText = need.error + QStringLiteral("\n\n") + need.command;
     else if (!need.packages.isEmpty())
         m_needsText = QStringLiteral("These packages are missing on %1:\n").arg(m_hostTitle) + need.command;
     else
         m_needsText.clear();
     reload();
-    if (!need.connected || !need.sudo)
+    if (!need.connected || !sudoReady)
         setError(need.error);
     else
         setError({});
     if (!m_needsText.isEmpty())
         emit needsReady();
     emit hostChanged();
-    return need.connected && need.sudo && need.packages.isEmpty();
+    return need.connected && sudoReady && need.packages.isEmpty();
+}
+
+bool Backend::setSudoPassword(const QString &password) {
+    if (password.isEmpty() || password.contains('\n') || password.contains('\r')) {
+        setError(QStringLiteral("The sudo password cannot be empty or contain a line break."));
+        return false;
+    }
+    if (!m_link) {
+        setError(QStringLiteral("Connect to a computer before typing its sudo password."));
+        return false;
+    }
+    m_sudoPassword = password;
+    if (!m_neededPackages.isEmpty()) {
+        m_canInstall = true;
+        m_needsText = QStringLiteral("These packages are missing on %1:\n").arg(m_hostTitle)
+            + installCommand(m_remoteProfile, m_neededPackages);
+    }
+    emit hostChanged();
+    reload();
+    emit hostChanged();
+    return true;
 }
 
 bool Backend::trustHost() {

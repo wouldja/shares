@@ -400,18 +400,6 @@ QHash<QString, CommandResult> RemoteCommands::runBatch(const QVector<ProbeReques
     return Commands::runBatch(probes);
 }
 
-OsProfile profileForRelease(const QString &id, const QString &idLike) {
-    OsProfile profile;
-    const auto blob = (id + " " + idLike).toLower();
-    if (blob.contains("debian") || blob.contains("ubuntu")) {
-        profile.family = "debian";
-        profile.sambaUnit = "smbd";
-        profile.nfsPackage = "nfs-kernel-server";
-        profile.iscsiUnit = "rtslib-fb-targetctl";
-    }
-    return profile;
-}
-
 bool remoteTargetOk(const QString &user, const QString &host, int port) {
     static const QRegularExpression hostRe("^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$");
     if (!accountNameOk(user) || port < 1 || port > 65535)
@@ -500,6 +488,40 @@ QVector<QStringList> installArgv(const OsProfile &profile, const QStringList &pa
     return {install};
 }
 
+QStringList sudoCommand(const QStringList &argv, const QString &password) {
+    if (password.isEmpty() || argv.size() < 2 || argv.at(0) != QStringLiteral("sudo") || argv.at(1) != QStringLiteral("-n"))
+        return argv;
+    // OpenSSH joins the remote command with spaces and drops an empty
+    // argument. `sudo -S -p '' cmd` arrives as `sudo -S -p cmd`, sudo prints
+    // its usage, and the password on stdin is never read. `--prompt=` is one
+    // token, so the prompt stays empty and the password is read.
+    QStringList wrapped{QStringLiteral("sudo"), QStringLiteral("-S"), QStringLiteral("--prompt=")};
+    wrapped += argv.mid(2);
+    return wrapped;
+}
+
+QString shareReadError(const QString &message, bool hadPassword) {
+    const auto trimmed = message.trimmed();
+    const bool rejected = trimmed.contains(QStringLiteral("incorrect password"))
+        || trimmed.contains(QStringLiteral("Sorry, try again"))
+        || trimmed.contains(QStringLiteral("no password was provided"))
+        || trimmed.contains(QStringLiteral("authentication failure"));
+    if (hadPassword && rejected)
+        return QStringLiteral("That sudo password was not accepted.");
+    if (!hadPassword
+        && (trimmed.contains(QStringLiteral("a password is required")) || trimmed.contains(QStringLiteral("sudo"))))
+        return QStringLiteral("The SSH user needs passwordless sudo to read the share files.");
+    if (trimmed.isEmpty())
+        return QStringLiteral("Could not read the share files.");
+    return trimmed;
+}
+
+QString sudoStdin(const QString &password, const QString &input) {
+    if (password.isEmpty())
+        return input;
+    return password + QLatin1Char('\n') + input;
+}
+
 QStringList remoteProbeToolPaths() {
     return {"/usr/sbin/smbd", "/usr/bin/smbd", "/usr/sbin/exportfs", "/usr/bin/exportfs", "/usr/bin/targetcli",
             "/usr/sbin/targetcli", "/usr/bin/python3"};
@@ -569,7 +591,8 @@ RemoteNeed probeRemote(RemoteLink *link) {
                                     exists({"/usr/bin/targetcli", "/usr/sbin/targetcli"}), exists({"/usr/bin/python3"}));
     need.command = installCommand(need.profile, need.packages);
     if (!need.sudo)
-        need.error = "The SSH user needs passwordless sudo before Shares can install packages or save.";
+        need.error = "The SSH user needs passwordless sudo before Shares can install packages or save.\n"
+                     "You can type the sudo password in this window. It is not saved.";
     return need;
 }
 
@@ -631,22 +654,19 @@ bool writeRemoteBundle(const QByteArray &payload, const QString &root, QString *
     return true;
 }
 
-bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error) {
-    const auto result = link->exec(remoteBundleArgv(), {}, 20000);
+bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error, const QString &sudoPassword) {
+    const auto result = link->exec(sudoCommand(remoteBundleArgv(), sudoPassword), sudoStdin(sudoPassword, {}), 20000);
     const auto message = result.err + result.out;
     if (result.code != 0) {
-        if (message.contains("a password is required") || message.contains("sudo")) {
-            if (error && error->isEmpty())
-                *error = "The SSH user needs passwordless sudo to read the share files.";
-        } else if (error && error->isEmpty()) {
-            *error = message.trimmed().isEmpty() ? QStringLiteral("Could not read the share files.") : message.trimmed();
-        }
+        if (error && error->isEmpty())
+            *error = shareReadError(message, !sudoPassword.isEmpty());
         return false;
     }
     return writeRemoteBundle(result.out.toUtf8(), root, error);
 }
 
-bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QStringList &packages, QString *error) {
+bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QStringList &packages, QString *error,
+                               const QString &sudoPassword) {
     const auto commands = installArgv(profile, packages);
     if (commands.isEmpty()) {
         if (error)
@@ -654,7 +674,7 @@ bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QSt
         return false;
     }
     for (const auto &argv : commands) {
-        const auto result = link->exec(argv, {}, 180000);
+        const auto result = link->exec(sudoCommand(argv, sudoPassword), sudoStdin(sudoPassword, {}), 180000);
         if (result.code != 0) {
             const auto message = (result.err + "\n" + result.out).trimmed();
             if (error)
@@ -665,23 +685,27 @@ bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QSt
     return true;
 }
 
-bool applyRemotePlan(RemoteLink *link, const QByteArray &helper, const QByteArray &plan, QString *error, QString *output) {
-    const auto directory = link->exec({"sudo", "-n", "mkdir", "-p", "/usr/local/lib/shares"}, {}, 20000);
+bool applyRemotePlan(RemoteLink *link, const QByteArray &helper, const QByteArray &plan, QString *error, QString *output,
+                     const QString &sudoPassword) {
+    const QStringList directoryArgs{"sudo", "-n", "mkdir", "-p", "/usr/local/lib/shares"};
+    const auto directory = link->exec(sudoCommand(directoryArgs, sudoPassword), sudoStdin(sudoPassword, {}), 20000);
     if (directory.code != 0) {
         if (error)
             *error = "Could not prepare /usr/local/lib/shares on that computer.";
         return false;
     }
     // The helper is a fixed program. The plan follows on a later stdin, so a
-    // share path or a password is never part of the SSH command text.
-    const auto sent = link->exec({"sudo", "-n", "tee", "/usr/local/lib/shares/apply.py"}, QString::fromUtf8(helper), 20000);
+    // share path or a password is never part of the SSH command text. sudo -S
+    // consumes only the first stdin line, and the helper sees the rest.
+    const QStringList teeArgs{"sudo", "-n", "tee", "/usr/local/lib/shares/apply.py"};
+    const auto sent = link->exec(sudoCommand(teeArgs, sudoPassword), sudoStdin(sudoPassword, QString::fromUtf8(helper)), 20000);
     if (sent.code != 0) {
         if (error)
             *error = "Could not install the apply helper on that computer.";
         return false;
     }
-    const auto applied = link->exec({"sudo", "-n", "python3", "/usr/local/lib/shares/apply.py", "--root", "/"},
-                                    QString::fromUtf8(plan), 120000);
+    const QStringList applyArgs{"sudo", "-n", "python3", "/usr/local/lib/shares/apply.py", "--root", "/"};
+    const auto applied = link->exec(sudoCommand(applyArgs, sudoPassword), sudoStdin(sudoPassword, QString::fromUtf8(plan)), 120000);
     if (output)
         output->append(applied.out);
     if (applied.code != 0) {

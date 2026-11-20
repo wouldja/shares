@@ -67,6 +67,7 @@ class Backend : public QObject {
     Q_PROPERTY(QVariantList hosts READ hosts NOTIFY hostChanged)
     Q_PROPERTY(QString needsText READ needsText NOTIFY hostChanged)
     Q_PROPERTY(bool canInstall READ canInstall NOTIFY hostChanged)
+    Q_PROPERTY(bool sudoPasswordNeeded READ sudoPasswordNeeded NOTIFY hostChanged)
     Q_PROPERTY(bool canTrustHost READ canTrustHost NOTIFY hostChanged)
     Q_PROPERTY(bool connecting READ connecting NOTIFY hostChanged)
     Q_PROPERTY(bool smbScanning READ smbScanning NOTIFY smbChanged)
@@ -110,6 +111,7 @@ public:
     QVariantList hosts() const { return m_hostRows; }
     QString needsText() const { return m_needsText; }
     bool canInstall() const { return m_canInstall; }
+    bool sudoPasswordNeeded() const { return m_sudoPasswordNeeded; }
     bool canTrustHost() const { return m_canTrustHost; }
     bool connecting() const { return m_connecting; }
     bool smbScanning() const { return m_smbScanning; }
@@ -157,6 +159,7 @@ public:
     Q_INVOKABLE bool openSmbShare(int index);
     Q_INVOKABLE bool leaveComputer();
     Q_INVOKABLE bool installNeeds();
+    Q_INVOKABLE bool setSudoPassword(const QString &password);
     Q_INVOKABLE bool trustHost();
 
 signals:
@@ -235,6 +238,7 @@ private:
     void ensureSessions(int protocol);
     void applySessions(int wave, int protocol, const QStringList &sessions);
     void scheduleRemoteReload(int wave);
+    void noteSudoRead(const QString &pullError);
     bool beginConnect(const RemoteHost &host);
     void applyConnect(const ConnectResult &result, const std::shared_ptr<RemoteLink> &link);
     std::shared_ptr<Commands> liveCommands() const;
@@ -286,6 +290,9 @@ private:
     int m_pendingPort = 22;
     bool m_pendingTailscaleSsh = false;
     bool m_canInstall = false;
+    // Held for this connection only. It is not written to the host file.
+    QString m_sudoPassword;
+    bool m_sudoPasswordNeeded = false;
     bool m_canTrustHost = false;
     bool m_connecting = false;
     bool m_trustNextConnect = false;

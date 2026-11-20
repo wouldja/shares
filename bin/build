@@ -2,10 +2,19 @@
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-mkdir -p "$ROOT/build"
-cd "$ROOT/build"
+mkdir -p "$ROOT/build" "$ROOT/build/apply"
 
-qmake6 "$ROOT/shares.pro"
-make -j"$(nproc)"
+(
+    cd "$ROOT/build"
+    qmake6 "$ROOT/shares.pro"
+    make -j"$(nproc)"
+)
+
+(
+    cd "$ROOT/build/apply"
+    qmake6 "$ROOT/shares-apply.pro"
+    make -j"$(nproc)"
+)
 
 echo "Built $ROOT/build/shares"
+echo "Built $ROOT/build/apply/shares-apply"

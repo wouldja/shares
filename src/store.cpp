@@ -28,6 +28,35 @@ QString readFile(const QString &path) {
     return QString::fromUtf8(file.readAll());
 }
 
+// Export lines move into shares.exports. Prose comments stay in the file they came from.
+QString stripNfsExportLines(const QString &text, bool *removed) {
+    const bool trailing = text.endsWith('\n');
+    const auto lines = text.split('\n');
+    QStringList kept;
+    bool any = false;
+    for (int i = 0; i < lines.size(); ++i) {
+        const auto &line = lines.at(i);
+        if (i == lines.size() - 1 && line.isEmpty())
+            continue;
+        if (!line.trimmed().isEmpty() && !parseNfs(line).isEmpty()) {
+            any = true;
+            continue;
+        }
+        kept << line;
+    }
+    if (removed)
+        *removed = any;
+    if (!any)
+        return text;
+    QString out = kept.join('\n');
+    if (!out.endsWith('\n'))
+        out += '\n';
+    if (!out.contains(QStringLiteral("/etc/exports.d/shares.exports")))
+        out += QStringLiteral("# Moved to /etc/exports.d/shares.exports by Shares.\n");
+    Q_UNUSED(trailing);
+    return out;
+}
+
 QString serviceState(const CommandResult &result, const QString &unit, const QString &package) {
     if (result.missing)
         return package + " is not installed";
@@ -97,6 +126,47 @@ QStringList tailnetName(const QString &json) {
 bool loopbackOrigin(const QString &url) {
     static const QRegularExpression re("^http://127\\.0\\.0\\.1:[0-9]{2,5}$");
     return re.match(url).hasMatch();
+}
+
+bool fileAllowed(const QString &relativePath) {
+    if (relativePath.contains(QStringLiteral("..")) || relativePath.startsWith('/') || relativePath.contains('\\'))
+        return false;
+    if (kFiles.contains(relativePath) || relativePath == QStringLiteral("etc/exports"))
+        return true;
+    static const QRegularExpression exports("^etc/exports\\.d/[A-Za-z0-9][A-Za-z0-9._-]*\\.exports$");
+    return exports.match(relativePath).hasMatch();
+}
+
+bool alreadyExistsMessage(const QString &message) {
+    const auto text = message.toLower();
+    return text.contains(QStringLiteral("already exists")) || text.contains(QStringLiteral("file exists"));
+}
+
+OsProfile profileForRelease(const QString &id, const QString &idLike) {
+    OsProfile profile;
+    const auto blob = (id + " " + idLike).toLower();
+    if (blob.contains("debian") || blob.contains("ubuntu")) {
+        profile.family = "debian";
+        profile.sambaUnit = "smbd";
+        profile.nfsPackage = "nfs-kernel-server";
+        profile.iscsiUnit = "rtslib-fb-targetctl";
+    }
+    return profile;
+}
+
+OsProfile profileOfThisMachine() {
+    QFile release(QStringLiteral("/etc/os-release"));
+    QString id;
+    QString like;
+    if (release.open(QIODevice::ReadOnly)) {
+        for (const auto &line : QString::fromUtf8(release.readAll()).split('\n')) {
+            if (line.startsWith(QStringLiteral("ID=")))
+                id = line.mid(3).trimmed().remove('"');
+            if (line.startsWith(QStringLiteral("ID_LIKE=")))
+                like = line.mid(8).trimmed().remove('"');
+        }
+    }
+    return profileForRelease(id, like);
 }
 
 Commands::~Commands() = default;
@@ -179,7 +249,23 @@ void Library::loadFiles() {
     for (const auto &name : files)
         exports += readFile(exportsDir.filePath(name));
     exports += readFile(m_root + "/etc/exports");
-    nfs = parseNfs(exports);
+    nfs.clear();
+    for (const auto &exp : parseNfs(exports)) {
+        bool duplicate = false;
+        for (const auto &have : nfs) {
+            if (have.path != exp.path || have.enabled != exp.enabled || have.clients.size() != exp.clients.size())
+                continue;
+            bool same = true;
+            for (int i = 0; i < have.clients.size(); ++i) {
+                if (have.clients.at(i).host != exp.clients.at(i).host || have.clients.at(i).options != exp.clients.at(i).options)
+                    same = false;
+            }
+            if (same)
+                duplicate = true;
+        }
+        if (!duplicate)
+            nfs.append(exp);
+    }
 
     bool iscsiOk = false;
     iscsi = parseIscsiJson(readFile(m_root + "/etc/shares/iscsi.json").toUtf8(), &iscsiOk);
@@ -354,8 +440,16 @@ Plan Library::plan(const SambaConfig &nextSamba, const QVector<NfsExport> &nextN
                 return plan;
             }
         }
-        if (share.extra.contains("include")) {
-            plan.error = "An advanced key cannot include another file.";
+        for (auto it = share.extra.cbegin(); it != share.extra.cend(); ++it) {
+            if (dangerousSambaKey(it.key()) || it.value().contains('\n') || it.value().contains('\r')) {
+                plan.error = "Shares will not write a Samba key that runs a program.";
+                return plan;
+            }
+        }
+    }
+    for (auto it = nextSamba.global.extra.cbegin(); it != nextSamba.global.extra.cend(); ++it) {
+        if (dangerousSambaKey(it.key()) || it.value().contains('\n') || it.value().contains('\r')) {
+            plan.error = "Shares will not write a Samba key that runs a program.";
             return plan;
         }
     }
@@ -386,6 +480,24 @@ Plan Library::plan(const SambaConfig &nextSamba, const QVector<NfsExport> &nextN
         plan.files.append({"etc/samba/smb.conf", ensureSambaInclude(currentSmb)});
     }
     plan.files.append({"etc/exports.d/shares.exports", nfsText(nextNfs)});
+    // Anything still published from /etc/exports or another exports.d file would
+    // be exported a second time. Leave the prose, and keep the exports in one file.
+    auto migrateExports = [&plan, this](const QString &relativePath) {
+        if (relativePath == QStringLiteral("etc/exports.d/shares.exports"))
+            return;
+        bool removed = false;
+        const auto current = readFile(m_root + "/" + relativePath);
+        if (current.isEmpty())
+            return;
+        const auto stripped = stripNfsExportLines(current, &removed);
+        if (!removed || stripped == current || !fileAllowed(relativePath))
+            return;
+        plan.files.append({relativePath, stripped});
+    };
+    migrateExports(QStringLiteral("etc/exports"));
+    const QDir exportDir(m_root + "/etc/exports.d");
+    for (const auto &name : exportDir.entryList({"*.exports"}, QDir::Files, QDir::Name))
+        migrateExports(QStringLiteral("etc/exports.d/") + name);
     plan.files.append({"etc/shares/iscsi.json", QString::fromUtf8(iscsiJson(nextIscsi))});
     plan.files.append({"etc/shares/s3.json", QString("{\n    \"rustfs\": \"%1\"\n}\n").arg(rustfsEndpoint)});
     for (const auto &share : nextSamba.shares) {
@@ -437,13 +549,37 @@ Plan Library::plan(const SambaConfig &nextSamba, const QVector<NfsExport> &nextN
         }
         plan.commands.append({args, {}});
     }
-    for (const auto &line : iscsiApplyCommands(nextIscsi)) {
-        const auto args = line.split(' ', Qt::SkipEmptyParts);
-        if (!commandAllowed(args)) {
+    static const QRegularExpression poolRe("^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$");
+    for (const auto &device : nextIscsi.devices) {
+        if (!device.size.isEmpty() && !iscsiSizeOk(device.size)) {
+            plan.error = "Size looks like 1G.";
+            return plan;
+        }
+        if (nextIscsi.clustered && !poolRe.match(nextIscsi.pool).hasMatch()) {
+            plan.error = "The pool name uses letters and numbers.";
+            return plan;
+        }
+    }
+    for (const auto &target : nextIscsi.targets) {
+        for (const auto &portal : target.portals) {
+            if (!nfsHostOk(portal.address) || !portOk(portal.port)) {
+                plan.error = "A portal looks like 0.0.0.0 3260.";
+                return plan;
+            }
+        }
+        for (const auto &acl : target.acls) {
+            if (!acl.password.isEmpty() && !chapSecretOk(acl.password)) {
+                plan.error = "CHAP password cannot contain a space or a line break.";
+                return plan;
+            }
+        }
+    }
+    for (const auto &command : iscsiApplyCommands(nextIscsi)) {
+        if (!commandAllowed(command.args, command.input)) {
             plan.error = "An iSCSI setting uses a character Shares will not send.";
             return plan;
         }
-        plan.commands.append({args, {}});
+        plan.commands.append({command.args, command.input});
     }
     // Deleting the last target does not go through iscsiApplyCommands, but the
     // deletion still has to be saved. Skip saveconfig when targetcli was never
@@ -484,60 +620,96 @@ bool applyPlan(const QString &root, const Plan &plan, Commands *commands, QStrin
     if (base.endsWith('/') && base.size() > 1)
         base.chop(1);
     for (const auto &file : plan.files) {
-        if (!kFiles.contains(file.first) || file.first.contains("..")) {
+        if (!fileAllowed(file.first)) {
             if (error)
                 *error = "Refusing to write " + file.first;
             return false;
         }
-        const auto dest = base + "/" + file.first;
-        QDir().mkpath(QFileInfo(dest).absolutePath());
-        QSaveFile out(dest);
-        if (!out.open(QIODevice::WriteOnly)) {
+        if (file.first == QStringLiteral("etc/samba/shares.conf") && sambaTextHasDangerousKey(file.second)) {
             if (error)
-                *error = "Could not write " + dest + ". " + out.errorString();
+                *error = "Shares will not write a Samba key that runs a program.";
             return false;
         }
+    }
+    struct PreviousFile {
+        QString dest;
+        bool existed = false;
+        QByteArray body;
+        QFileDevice::Permissions permissions;
+    };
+    QVector<PreviousFile> previous;
+    auto restore = [&previous]() {
+        for (const auto &item : previous) {
+            if (!item.existed) {
+                QFile::remove(item.dest);
+                continue;
+            }
+            QFile file(item.dest);
+            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                continue;
+            file.write(item.body);
+            file.setPermissions(item.permissions);
+        }
+    };
+    auto fail = [&](const QString &message) {
+        if (!previous.isEmpty())
+            restore();
+        if (error) {
+            *error = message;
+            if (!previous.isEmpty() && !message.contains(QStringLiteral("restored")))
+                *error += QStringLiteral("\nThe previous files were restored.");
+        }
+        return false;
+    };
+    for (const auto &file : plan.files) {
+        const auto dest = base + "/" + file.first;
+        QFileInfo existing(dest);
+        PreviousFile saved;
+        saved.dest = dest;
+        saved.existed = existing.exists() && existing.isFile();
+        if (saved.existed) {
+            QFile prior(dest);
+            if (prior.open(QIODevice::ReadOnly))
+                saved.body = prior.readAll();
+            saved.permissions = existing.permissions();
+        }
+        previous.append(saved);
+        QDir().mkpath(QFileInfo(dest).absolutePath());
+        QSaveFile out(dest);
+        if (!out.open(QIODevice::WriteOnly))
+            return fail("Could not write " + dest + ". " + out.errorString());
         // CHAP secrets live in the iSCSI record. Keep that file unreadable
         // by anyone but root.
         if (file.first.endsWith(".json"))
             out.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
         out.write(file.second.toUtf8());
-        if (!out.commit()) {
-            if (error)
-                *error = "Could not commit " + dest;
-            return false;
-        }
+        if (!out.commit())
+            return fail("Could not commit " + dest);
     }
     if (!commands)
         return true;
     for (const auto &command : plan.commands) {
-        if (!commandAllowed(command.args)) {
-            if (error)
-                *error = "Refusing to run " + command.args.join(' ');
-            return false;
-        }
+        if (!commandAllowed(command.args, command.input))
+            return fail("Refusing to run " + command.args.join(' '));
         const auto result = commands->run(command.args.first(), command.args.mid(1), command.input);
         if (output && !result.out.isEmpty())
             output->append(result.out);
-        if (result.missing) {
-            if (error)
-                *error = command.args.first() + " is not installed";
-            return false;
-        }
+        if (result.missing)
+            return fail(command.args.first() + " is not installed");
         if (result.code == 0)
             continue;
-        const auto message = (result.err + " " + result.out).toLower();
+        const auto message = result.err + " " + result.out;
         // Creating an object that is already there is the normal second save.
+        // "does not exist" is a real failure and must not match.
         const bool already = (command.args.first() == "targetcli" || command.args.first() == "gwcli" || command.args.first() == "rbd"
                               || command.args.first() == "mkdir")
-            && message.contains("exist");
+            && alreadyExistsMessage(message);
         if (already)
             continue;
-        if (error)
-            *error = result.err.trimmed().isEmpty() ? result.out.trimmed() : result.err.trimmed();
-        if (error && error->isEmpty())
-            *error = command.args.first() + " failed";
-        return false;
+        auto why = result.err.trimmed().isEmpty() ? result.out.trimmed() : result.err.trimmed();
+        if (why.isEmpty())
+            why = command.args.first() + " failed";
+        return fail(why);
     }
     return true;
 }
@@ -581,6 +753,127 @@ Plan planFromJson(const QByteArray &bytes, bool *ok) {
     return plan;
 }
 
+QByteArray saveOperation(const SambaConfig &samba, const QVector<NfsExport> &nfs, const IscsiConfig &iscsi,
+                         const QString &rustfsEndpoint) {
+    QJsonObject object{{"op", "save"},
+                       {"samba", sambaToJson(samba)},
+                       {"nfs", nfsToJson(nfs)},
+                       {"iscsi", QJsonDocument::fromJson(iscsiJson(iscsi)).object()}};
+    if (!rustfsEndpoint.isEmpty())
+        object.insert(QStringLiteral("rustfs"), rustfsEndpoint);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+QByteArray passwordOperation(const QString &action, const QString &user, const QString &password) {
+    const auto op = action == QStringLiteral("remove") ? QStringLiteral("smbpasswd-remove") : QStringLiteral("smbpasswd-add");
+    return QJsonDocument(QJsonObject{{"op", op}, {"user", user}, {"password", password}}).toJson(QJsonDocument::Compact);
+}
+
+QByteArray s3BucketOperation(const QString &backend, const QString &action, const QString &name, const QString &endpoint) {
+    return QJsonDocument(QJsonObject{{"op", "s3-bucket"},
+                                     {"backend", backend},
+                                     {"action", action},
+                                     {"name", name},
+                                     {"endpoint", endpoint}})
+        .toJson(QJsonDocument::Compact);
+}
+
+QByteArray s3AccessOperation(const QString &backend, const QString &action, const QString &name, const QString &secret) {
+    return QJsonDocument(QJsonObject{{"op", "s3-access"},
+                                     {"backend", backend},
+                                     {"action", action},
+                                     {"name", name},
+                                     {"secret", secret}})
+        .toJson(QJsonDocument::Compact);
+}
+
+bool applyOperation(const QString &root, const QByteArray &json, Commands *commands, QString *error, QString *output) {
+    const auto doc = QJsonDocument::fromJson(json);
+    if (!doc.isObject()) {
+        if (error)
+            *error = QStringLiteral("The request was not valid.");
+        return false;
+    }
+    const auto object = doc.object();
+    const auto op = object.value(QStringLiteral("op")).toString();
+    Library library(root, commands);
+    library.setProfile(profileOfThisMachine());
+    library.loadFiles();
+    Plan plan;
+    if (op == QStringLiteral("save")) {
+        if (!object.value(QStringLiteral("samba")).isObject() || !object.value(QStringLiteral("nfs")).isArray()
+            || !object.value(QStringLiteral("iscsi")).isObject()) {
+            if (error)
+                *error = QStringLiteral("The request was not valid.");
+            return false;
+        }
+        if (object.contains(QStringLiteral("rustfs"))) {
+            const auto origin = object.value(QStringLiteral("rustfs")).toString();
+            if (!loopbackOrigin(origin)) {
+                if (error)
+                    *error = QStringLiteral("The RustFS address has to be http://127.0.0.1 and a port.");
+                return false;
+            }
+            library.rustfsEndpoint = origin;
+        }
+        bool sambaOk = false;
+        const auto samba = sambaFromJson(object.value(QStringLiteral("samba")).toObject(), &sambaOk);
+        if (!sambaOk) {
+            if (error)
+                *error = QStringLiteral("The request was not valid.");
+            return false;
+        }
+        const auto iscsiBytes = QJsonDocument(object.value(QStringLiteral("iscsi")).toObject()).toJson(QJsonDocument::Compact);
+        plan = library.plan(samba, nfsFromJson(object.value(QStringLiteral("nfs")).toArray()), parseIscsiJson(iscsiBytes));
+    } else if (op == QStringLiteral("smbpasswd-add") || op == QStringLiteral("smbpasswd-remove")) {
+        const auto user = object.value(QStringLiteral("user")).toString();
+        const auto password = object.value(QStringLiteral("password")).toString();
+        if (!accountNameOk(user)) {
+            if (error)
+                *error = QStringLiteral("Account names are lowercase and start with a letter.");
+            return false;
+        }
+        if (op == QStringLiteral("smbpasswd-add")) {
+            if (password.isEmpty() || password.contains('\n') || password.contains('\r')) {
+                if (error)
+                    *error = QStringLiteral("The Samba password cannot be empty or contain a line break.");
+                return false;
+            }
+            plan.commands.append({{"smbpasswd", "-s", "-a", user}, password + "\n" + password + "\n"});
+        } else {
+            plan.commands.append({{"smbpasswd", "-x", user}, {}});
+        }
+    } else if (op == QStringLiteral("s3-bucket")) {
+        QString why;
+        const auto args = s3BucketArgs(object.value(QStringLiteral("backend")).toString(), object.value(QStringLiteral("action")).toString(),
+                                        object.value(QStringLiteral("name")).toString(), object.value(QStringLiteral("endpoint")).toString(),
+                                        &why);
+        if (args.isEmpty()) {
+            if (error)
+                *error = why.isEmpty() ? QStringLiteral("The request was not valid.") : why;
+            return false;
+        }
+        plan.commands.append({args, {}});
+    } else if (op == QStringLiteral("s3-access")) {
+        QString why;
+        QString input;
+        const auto args = s3AccessArgs(object.value(QStringLiteral("backend")).toString(), object.value(QStringLiteral("action")).toString(),
+                                        object.value(QStringLiteral("name")).toString(), object.value(QStringLiteral("secret")).toString(),
+                                        &why, &input);
+        if (args.isEmpty()) {
+            if (error)
+                *error = why.isEmpty() ? QStringLiteral("The request was not valid.") : why;
+            return false;
+        }
+        plan.commands.append({args, input});
+    } else {
+        if (error)
+            *error = QStringLiteral("The request was not valid.");
+        return false;
+    }
+    return applyPlan(root, plan, commands, error, output);
+}
+
 QStringList s3BucketArgs(const QString &backend, const QString &action, const QString &name, const QString &endpoint, QString *error) {
     if (!shareNameOk(name)) {
         if (error)
@@ -611,20 +904,24 @@ QStringList s3BucketArgs(const QString &backend, const QString &action, const QS
     return {};
 }
 
-QStringList s3AccessArgs(const QString &backend, const QString &action, const QString &name, const QString &secret, QString *error) {
+QStringList s3AccessArgs(const QString &backend, const QString &action, const QString &name, const QString &secret, QString *error,
+                         QString *input) {
     if (!accountNameOk(name) && !shareNameOk(name)) {
         if (error)
             *error = "Access names use letters, numbers, and . _ -.";
         return {};
     }
     if (backend == "minio" && action == "create") {
-        static const QRegularExpression token("^[A-Za-z0-9_./:=+@,%|-]+$");
-        if (secret.isEmpty() || !token.match(secret).hasMatch()) {
+        // mc is not a terminal. With only the alias on the command line it reads
+        // the access key and the secret as two lines, so the secret can contain spaces.
+        if (secret.isEmpty() || secret.contains('\n') || secret.contains('\r')) {
             if (error)
-                *error = "MinIO takes the password on the command line, so it cannot contain spaces or quotes.";
+                *error = "The MinIO secret cannot be empty or contain a line break.";
             return {};
         }
-        return {"mc", "admin", "user", "add", "local", name, secret};
+        if (input)
+            *input = name + "\n" + secret + "\n";
+        return {"mc", "admin", "user", "add", "local"};
     }
     if (backend == "minio" && action == "delete")
         return {"mc", "admin", "user", "remove", "local", name};

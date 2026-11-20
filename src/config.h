@@ -1,7 +1,10 @@
 #pragma once
 
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QMap>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 // File formats Shares reads and writes. Samba and NFS match the on-disk
@@ -118,10 +121,26 @@ QVector<NfsExport> parseNfs(const QString &text);
 QByteArray iscsiJson(const IscsiConfig &config);
 IscsiConfig parseIscsiJson(const QByteArray &json, bool *ok = nullptr);
 
-QStringList iscsiApplyCommands(const IscsiConfig &config);
-bool commandAllowed(const QStringList &args);
+QJsonObject sambaToJson(const SambaConfig &config);
+SambaConfig sambaFromJson(const QJsonObject &object, bool *ok = nullptr);
+QJsonArray nfsToJson(const QVector<NfsExport> &exports);
+QVector<NfsExport> nfsFromJson(const QJsonArray &array);
+
+// One command the privileged helper may run. input is stdin, never an argument.
+struct IssuedCommand {
+    QStringList args;
+    QString input;
+};
+
+QVector<IssuedCommand> iscsiApplyCommands(const IscsiConfig &config);
+bool commandAllowed(const QStringList &args, const QString &input = {});
 bool shareNameOk(const QString &name);
 bool absolutePathOk(const QString &path);
 bool nfsHostOk(const QString &host);
 bool nfsOptionsOk(const QString &options);
 bool accountNameOk(const QString &name);
+bool iscsiSizeOk(const QString &size);
+bool portOk(const QString &port);
+bool chapSecretOk(const QString &secret);
+bool dangerousSambaKey(const QString &key);
+bool sambaTextHasDangerousKey(const QString &text);

@@ -90,7 +90,7 @@ public:
             return {installed || key == "test -x /usr/bin/python3" ? 0 : 1, {}, {}, false};
         if (key.startsWith("sudo -n cat"))
             return {1, {}, "cat: No such file or directory", false};
-        if (key.startsWith("sudo -n "))
+        if (key.startsWith("sudo -n ") || key.startsWith("sudo -S "))
             return {0, {}, {}, false};
         if (argv.value(0) == "hostname")
             return {0, "pve\n", {}, false};
@@ -398,10 +398,20 @@ private slots:
         QVERIFY(smb.contains("[homes]"));
         QVERIFY(!smb.contains("[photos]"));
         QVERIFY(readFile(dir.path() + "/etc/samba/shares.conf").contains("path = /srv/photos"));
+        const auto exports = readFile(dir.path() + "/etc/exports");
+        QVERIFY(exports.contains("NFS clients"));
+        QVERIFY(!exports.contains("/srv/photos"));
+        QVERIFY(!exports.contains("/srv/homes"));
+        QVERIFY(exports.contains("Moved to /etc/exports.d/shares.exports"));
+        const auto sharesExports = readFile(dir.path() + "/etc/exports.d/shares.exports");
+        QVERIFY(sharesExports.contains("/srv/photos"));
+        QVERIFY(sharesExports.contains("/srv/homes"));
         Backend again(dir.path(), &commands);
         QCOMPARE(again.rows().size(), 1);
         QCOMPARE(again.rows().first().toMap().value("name").toString(), QString("photos"));
         QVERIFY(!again.dirty());
+        again.setProtocol(1);
+        QCOMPARE(again.rows().size(), 2);
     }
 
     void iscsiSaveKeepsTheImage() {
@@ -666,11 +676,18 @@ private slots:
         QTemporaryDir dir;
         const auto made = dir.path() + "/made";
         const auto wrote = runApply({QStringLiteral("--root"), dir.path()},
-                                     applyPlanJson("etc/samba/shares.conf", "[photos]\n   path = /srv/photos\n",
+                                     applyPlanJson("etc/samba/shares.conf",
+                                                   QString("[photos]\n   path = %1\n").arg(made),
                                                    QJsonArray{"mkdir", "-p", made}));
         QCOMPARE(wrote.code, 0);
         QVERIFY(readFile(dir.path() + "/etc/samba/shares.conf").contains("[photos]"));
         QVERIFY(QFileInfo(made).isDir());
+        const auto unmentioned = runApply({QStringLiteral("--root"), dir.path()},
+                                           applyPlanJson("etc/samba/shares.conf", "[photos]\n   path = /srv/photos\n",
+                                                         QJsonArray{"mkdir", "-p", made + "-other"}));
+        QVERIFY(unmentioned.code != 0);
+        QVERIFY(unmentioned.err.contains("Refusing"));
+        QVERIFY(!QFileInfo(made + "-other").exists());
         const auto escaped = runApply({QStringLiteral("--root"), dir.path()},
                                        applyPlanJson("etc/../passwd", "nope", {}));
         QVERIFY(escaped.code != 0);
@@ -1262,6 +1279,238 @@ private slots:
         QVERIFY(link.inputs.at(listCall).contains("192.168.1.5\n"));
         QVERIFY(!link.calls.at(listCall).join(' ').contains("secret"));
         QVERIFY(spy.count() >= 1);
+    }
+
+    void alreadyExistsIsNotAMissingFile() {
+        QVERIFY(alreadyExistsMessage("File exists"));
+        QVERIFY(alreadyExistsMessage("The backstore already exists"));
+        QVERIFY(!alreadyExistsMessage("does not exist"));
+        QTemporaryDir dir;
+        FakeCommands missing;
+        missing.exact.insert("mkdir -p /srv/photos", {1, {}, "mkdir: does not exist\n", false});
+        Plan gone;
+        gone.commands.append({{"mkdir", "-p", "/srv/photos"}, {}});
+        QString error;
+        QVERIFY(!applyPlan(dir.path(), gone, &missing, &error));
+        QVERIFY(error.contains("does not exist"));
+        QVERIFY(!error.contains("restored"));
+        FakeCommands present;
+        present.exact.insert("mkdir -p /srv/photos", {1, {}, "mkdir: File exists\n", false});
+        Plan there;
+        there.commands.append({{"mkdir", "-p", "/srv/photos"}, {}});
+        QVERIFY(applyPlan(dir.path(), there, &present, &error));
+    }
+
+    void applyRestoresFilesWhenACommandFails() {
+        QTemporaryDir dir;
+        const auto conf = dir.path() + "/etc/samba/shares.conf";
+        QVERIFY(writeFile(conf, "[old]\n   path = /srv/old\n"));
+        FakeCommands commands;
+        const auto blocked = dir.path() + "/notdir/child";
+        commands.exact.insert("mkdir -p " + blocked, {1, {}, "mkdir: Not a directory\n", false});
+        Plan plan;
+        plan.files.append({QStringLiteral("etc/samba/shares.conf"), QStringLiteral("[photos]\n   path = /srv/photos\n")});
+        plan.commands.append({{"mkdir", "-p", blocked}, {}});
+        QString error;
+        QVERIFY(!applyPlan(dir.path(), plan, &commands, &error));
+        QVERIFY(error.contains("restored"));
+        QCOMPARE(readFile(conf), QString("[old]\n   path = /srv/old\n"));
+    }
+
+    void iscsiPathWithASpaceStaysOneArgument() {
+        const QStringList args{"targetcli", "/backstores/fileio", "create", "clips", "/srv/my disk.img", "1G"};
+        QVERIFY(commandAllowed(args));
+        QVERIFY(commandAllowed({"targetcli"},
+                               "/iscsi/iqn.2026-11.com.example:clips/tpg1/acls/iqn.1991-05.com.microsoft:host set auth "
+                               "password=secret\n"));
+        QVERIFY(!commandAllowed({"targetcli", "sessions"}));
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("hostname -s", {0, "files\n", {}, false});
+        commands.exact.insert("hostname -f", {0, "files\n", {}, false});
+        Backend backend(dir.path(), &commands);
+        backend.setProtocol(2);
+        QVERIFY(backend.create("clips", "/srv/my disk.img"));
+        QVERIFY(backend.save());
+        bool found = false;
+        for (const auto &call : commands.calls) {
+            if (call.contains(QStringLiteral("/srv/my disk.img"))) {
+                found = true;
+                QCOMPARE(call.first(), QString("targetcli"));
+            }
+        }
+        QVERIFY(found);
+    }
+
+    void editorRejectsADangerousKeyAndABadSize() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("hostname -s", {0, "files\n", {}, false});
+        commands.exact.insert("hostname -f", {0, "files\n", {}, false});
+        Backend backend(dir.path(), &commands);
+        backend.setProtocol(2);
+        QVERIFY(backend.create("clips", "/srv/iscsi/clips.img"));
+        QVERIFY(backend.applyEditor("size=1K\n"));
+        QVERIFY(!backend.applyEditor("size=lots\n"));
+        QVERIFY(backend.error().contains("1G"));
+        backend.setProtocol(0);
+        QVERIFY(backend.create("photos", "/srv/photos"));
+        QVERIFY(!backend.applyEditor("advanced:\nroot preexec = /bin/id\n"));
+        QVERIFY(backend.error().contains("runs a program"));
+        QVERIFY(!backend.importText("[photos]\n   path = /srv/photos\n   magic script = /bin/id\n"));
+        QVERIFY(backend.error().contains("runs a program"));
+    }
+
+    void minioSecretStaysOnStdin() {
+        QString error;
+        QString input;
+        const auto args = s3AccessArgs("minio", "create", "ada", "secret with space", &error, &input);
+        QCOMPARE(args, QStringList({"mc", "admin", "user", "add", "local"}));
+        QCOMPARE(input, QString("ada\nsecret with space\n"));
+        QVERIFY(commandAllowed(args, input));
+        QVERIFY(s3AccessArgs("minio", "create", "ada", "secret\nline", &error, &input).isEmpty());
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("mc --version", {0, "mc version\n", {}, false});
+        Backend backend(dir.path(), &commands);
+        backend.setProtocol(3);
+        QVERIFY(backend.createAccess("minio", "ada", "secret with space"));
+        bool found = false;
+        for (int i = 0; i < commands.calls.size(); ++i) {
+            if (commands.calls.at(i) == QStringList{"mc", "admin", "user", "add", "local"}) {
+                QCOMPARE(commands.inputs.at(i), QString("ada\nsecret with space\n"));
+                found = true;
+            }
+        }
+        QVERIFY(found);
+        QVERIFY(!joinedCalls(commands.calls).contains("secret with space"));
+    }
+
+    void sudoPasswordWrapsTheCommandAndStaysOffTheArguments() {
+        QCOMPARE(sudoCommand({"sudo", "-n", "true"}, {}), QStringList({"sudo", "-n", "true"}));
+        const auto wrapped = sudoCommand({"sudo", "-n", "tee", "/usr/local/lib/shares/apply.py"}, "secret");
+        QCOMPARE(wrapped, QStringList({"sudo", "-S", "--prompt=", "tee", "/usr/local/lib/shares/apply.py"}));
+        for (const auto &arg : wrapped)
+            QVERIFY(!arg.isEmpty());
+        QCOMPARE(shareReadError("Sorry, try again.\nsudo: 1 incorrect password attempt\n", true),
+                 QString("That sudo password was not accepted."));
+        QCOMPARE(shareReadError("sudo: a password is required\n", false),
+                 QString("The SSH user needs passwordless sudo to read the share files."));
+        QCOMPARE(sudoStdin("secret", "plan"), QString("secret\nplan"));
+        QCOMPARE(sudoStdin({}, "plan"), QString("plan"));
+    }
+
+    void sudoPasswordLetsInstallProceedAndIsNotSaved() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {1, {}, "sudo: a password is required\n", false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        QVERIFY(backend.addHost("share", "files.example.net", 22));
+        QVERIFY(backend.sudoPasswordNeeded());
+        QVERIFY(!backend.canInstall());
+        QVERIFY(!backend.setSudoPassword("bad\nsecret"));
+        QVERIFY(backend.setSudoPassword("secret"));
+        QVERIFY(!backend.sudoPasswordNeeded());
+        QVERIFY(backend.canInstall());
+        QVERIFY(!readFile(dir.path() + "/hosts.json").contains("secret"));
+        QVERIFY(backend.installNeeds());
+        const auto calls = joinedCalls(link.calls);
+        QVERIFY(calls.contains("sudo -S"));
+        QVERIFY(!calls.contains("secret"));
+        bool sawStdin = false;
+        for (const auto &input : link.inputs) {
+            if (input.startsWith("secret\n"))
+                sawStdin = true;
+        }
+        QVERIFY(sawStdin);
+    }
+
+    void applyOperationRebuildsThePlanFromTheModel() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        SambaConfig config;
+        SambaShare share;
+        share.name = "photos";
+        share.path = "/srv/photos";
+        config.shares.append(share);
+        QString error;
+        QVERIFY(applyOperation(dir.path(), saveOperation(config, {}, {}, "http://127.0.0.1:9000"), &commands, &error));
+        QVERIFY(error.isEmpty());
+        QVERIFY(readFile(dir.path() + "/etc/samba/shares.conf").contains("[photos]"));
+        QVERIFY(readFile(dir.path() + "/etc/shares/s3.json").contains("127.0.0.1:9000"));
+        QVERIFY(!applyOperation(dir.path(), saveOperation(config, {}, {}, "http://example.com:9000"), &commands, &error));
+        QVERIFY(error.contains("127.0.0.1"));
+        const QByteArray forged(
+            "{\"op\":\"save\",\"samba\":{\"global\":{},\"shares\":[]},\"nfs\":[],\"iscsi\":{},"
+            "\"files\":[{\"path\":\"etc/samba/shares.conf\",\"body\":\"root preexec = /bin/id\\n\"}]}");
+        QTemporaryDir other;
+        QVERIFY(applyOperation(other.path(), forged, &commands, &error));
+        QVERIFY(!readFile(other.path() + "/etc/samba/shares.conf").contains("preexec"));
+        QVERIFY(applyOperation(dir.path(), passwordOperation("add", "ada", "secret"), &commands, &error));
+        QCOMPARE(commands.calls.last(), QStringList({"smbpasswd", "-s", "-a", "ada"}));
+        QCOMPARE(commands.inputs.last(), QString("secret\nsecret\n"));
+    }
+
+    void applyHelperMatchesAllowlistAndRestores() {
+        if (QStandardPaths::findExecutable(QStringLiteral("python3")).isEmpty())
+            QSKIP("python3 is not installed");
+        QTemporaryDir dir;
+        const auto scriptPath = dir.path() + "/check_apply.py";
+        QVERIFY(writeFile(scriptPath,
+                          "import importlib.util, sys\n"
+                          "spec = importlib.util.spec_from_file_location('shares_apply', sys.argv[1])\n"
+                          "mod = importlib.util.module_from_spec(spec)\n"
+                          "spec.loader.exec_module(mod)\n"
+                          "url = 'http://127.0.0.1:9000/rustfs/admin/v3/buckets'\n"
+                          "assert mod.allowed(['curl', '-sf', '--connect-timeout', '2', '--max-time', '3', url], '')\n"
+                          "assert mod.allowed(['curl', '-sf', '-X', 'PUT', url + '/photos'], '')\n"
+                          "assert not mod.allowed(['curl', '-sf', '--connect-timeout', '20', '--max-time', '3', url], '')\n"
+                          "assert not mod.allowed(['targetcli', 'sessions'], '')\n"
+                          "assert not mod.allowed(['bash', '-c', 'id'], '')\n"
+                          "chap = '/iscsi/iqn.2026-11.com.example:clips/tpg1/acls/iqn.1991-05.com.microsoft:host set auth password=secret\\n'\n"
+                          "assert mod.allowed(['targetcli'], chap)\n"
+                          "assert mod.allowed(['mc', 'admin', 'user', 'add', 'local'], 'ada\\nsecret with space\\n')\n"
+                          "assert not mod.allowed(['mc', 'admin', 'user', 'add', 'local', 'ada', 'secret'], '')\n"
+                          "assert mod.already_exists('mkdir: File exists')\n"
+                          "assert not mod.already_exists('does not exist')\n"
+                          "assert mod.dangerous_shares('[photos]\\n   root preexec = /bin/id\\n')\n"
+                          "assert not mod.dangerous_shares('[photos]\\n   path = /srv/photos\\n')\n"
+                          "print('ok')\n"));
+        QProcess check;
+        check.start(QStringLiteral("python3"), {scriptPath, QString(SHARES_APPLY_PY)});
+        QVERIFY(check.waitForFinished(20000));
+        QCOMPARE(check.exitCode(), 0);
+
+        const auto curl = QJsonArray{"curl", "-sf", "--connect-timeout", "2", "--max-time", "3",
+                                      "http://127.0.0.1:9000/rustfs/admin/v3/buckets"};
+        const auto checked = runApply({QStringLiteral("--check"), QStringLiteral("--root"), dir.path()},
+                                       applyPlanJson("etc/samba/shares.conf", "[photos]\n   path = /srv/photos\n", curl));
+        QCOMPARE(checked.code, 0);
+        QVERIFY(!QFile::exists(dir.path() + "/etc/samba/shares.conf"));
+        const auto sessions = runApply({QStringLiteral("--check"), QStringLiteral("--root"), dir.path()},
+                                        applyPlanJson("etc/samba/shares.conf", "[photos]\n", QJsonArray{"targetcli", "sessions"}));
+        QVERIFY(sessions.code != 0);
+        QVERIFY(sessions.err.contains("Refusing"));
+        const auto dangerous = runApply(
+            {QStringLiteral("--check"), QStringLiteral("--root"), dir.path()},
+            applyPlanJson("etc/samba/shares.conf", "[photos]\n   root preexec = /bin/id\n", {}));
+        QVERIFY(dangerous.code != 0);
+        QVERIFY(dangerous.err.contains("runs a program"));
+
+        const auto conf = dir.path() + "/etc/samba/shares.conf";
+        QVERIFY(writeFile(conf, "[old]\n   path = /srv/old\n"));
+        QVERIFY(writeFile(dir.path() + "/blocker", "x"));
+        const auto blocked = dir.path() + "/blocker/child";
+        const auto restored = runApply({QStringLiteral("--root"), dir.path()},
+                                        applyPlanJson("etc/samba/shares.conf",
+                                                      QString("[photos]\n   path = %1\n").arg(blocked),
+                                                      QJsonArray{"mkdir", "-p", blocked}));
+        QVERIFY(restored.code != 0);
+        QVERIFY(restored.err.contains("restored"));
+        QCOMPARE(readFile(conf), QString("[old]\n   path = /srv/old\n"));
     }
 
     void themeFallsBack() {

@@ -25,7 +25,7 @@ Edits stay in the window until you press `Ctrl+S`. Saving the real machine asks 
 | Service | Files and tools |
 |---|---|
 | Samba | `/etc/samba/shares.conf`, an `include` line in `smb.conf`, `smbpasswd` for Samba passwords |
-| NFS | `/etc/exports.d/shares.exports`, then `exportfs -ra` |
+| NFS | `/etc/exports.d/shares.exports` only, then `exportfs -ra`. Export lines in `/etc/exports` and other `exports.d` files move there; prose comments stay |
 | iSCSI | `/etc/shares/iscsi.json`, then `targetcli` (or `gwcli` and `rbd` when clustered) |
 | S3 | `mc`, `garage`, `radosgw-admin`, or `curl` against the RustFS admin API on `127.0.0.1` |
 
@@ -33,7 +33,7 @@ If `smb.conf` still has its own share sections, Save moves them into `shares.con
 
 Removing a share, export, or target removes that definition only. The folder or disk image stays. Removing an S3 bucket asks the service to delete it and leaves the bucket in place when it is not empty.
 
-Samba can set guest access, read only, browsable, inherit permissions, valid users, Windows ACLs, ZFS or Ceph shadow copies, the MacOS fruit preset, audit logging, a directory mode, and creating a missing folder. Extra `smb.conf` keys are kept. Global settings cover the workgroup, server string, log level, and the MacOS preset. A Samba password does not change the Linux login password.
+Samba can set guest access, read only, browsable, inherit permissions, valid users, Windows ACLs, ZFS or Ceph shadow copies, the MacOS fruit preset, audit logging, a directory mode, and creating a missing folder. Extra `smb.conf` keys are kept, except keys that run a program (`include`, `preexec`, `postexec`, `root preexec`, `root postexec`, `magic script`). Global settings cover the workgroup, server string, log level, and the MacOS preset. A Samba password does not change the Linux login password. Samba passwords, MinIO secrets, and iSCSI CHAP passwords are written to the program's input. They are not command arguments, and they are not saved in the host file.
 
 ## ZFS
 
@@ -70,9 +70,9 @@ The Computers window also has **Windows shares**. Enter a Windows or SMB server 
 
 A computer that is not on the tailnet can be typed as a user, a host or LAN IP address, a port, and an optional SSH password. Passwords are used for the connection only and are not saved; leave the field empty to use your SSH key. The host name, user, and port are kept in the Shares config file, readable only by you. The first connection requires a host key you already trust. Trust key accepts that key once. Later connections check it again.
 
-The other computer does not need this window. It needs OpenSSH (`sshd`) or Tailscale SSH, `python3`, and passwordless `sudo` for the SSH user. Shares copies a small apply helper there and sends the same file plan it would write locally. The helper allows the same paths and commands, and a removal still leaves the folder, disk image, dataset, or zvol in place.
+The other computer does not need this window. It needs OpenSSH (`sshd`) or Tailscale SSH and `python3`. Passwordless `sudo` lets Shares read and save without asking again. If sudo asks for a password, type it in the window. That password stays in this process and is not saved. Shares copies a small apply helper there and sends the same file plan it would write locally. The helper allows the same paths and commands, and a removal still leaves the folder, disk image, dataset, or zvol in place.
 
-When a tool is missing, the window lists it and the exact install command. Install runs only after you press Install, and only when `sudo -n` already works. If a password is required, the window shows the command and does not prompt. S3 packages are not part of that install.
+When a tool is missing, the window lists it and the exact install command. Install runs only after you press Install, and only when passwordless sudo works or you have typed the sudo password. S3 packages are not part of that install. On this computer, Save asks polkit to run `shares-apply`, which rebuilds the plan from the model and the files already on disk.
 
 | | Arch | Debian, Ubuntu, Proxmox |
 |---|---|---|

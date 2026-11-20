@@ -88,21 +88,29 @@ private:
     RemoteLink *m_link = nullptr;
 };
 
-OsProfile profileForRelease(const QString &id, const QString &idLike);
 bool remoteTargetOk(const QString &user, const QString &host, int port);
 QVector<RemoteHost> tailscalePeers(const QString &json);
 QStringList missingPackages(const OsProfile &profile, bool samba, bool nfs, bool iscsi, bool python);
 QString installCommand(const OsProfile &profile, const QStringList &packages);
 QVector<QStringList> installArgv(const OsProfile &profile, const QStringList &packages);
+// An empty password leaves sudo -n in place. A password replaces that with
+// sudo -S and is written only on stdin, ahead of the command's own input.
+QStringList sudoCommand(const QStringList &argv, const QString &password);
+QString sudoStdin(const QString &password, const QString &input);
+// A failed remote read. A typed sudo password that sudo rejected stays
+// distinct from a computer that has no password yet.
+QString shareReadError(const QString &message, bool hadPassword);
 RemoteNeed probeRemote(RemoteLink *link);
 // One remote shell reads the OS, passwordless sudo, and the tool paths.
 QStringList remoteProbeArgv();
 QStringList remoteProbeToolPaths();
-bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error);
+bool pullRemoteFiles(RemoteLink *link, const QString &root, QString *error, const QString &sudoPassword = {});
 // One remote command reads the bounded share files. The payload is length-prefixed
 // text. writeRemoteBundle ignores any path outside that fixed set.
 QStringList remoteBundleArgv();
 QByteArray remoteBundlePayload(const QVector<QPair<QString, QByteArray>> &files);
 bool writeRemoteBundle(const QByteArray &payload, const QString &root, QString *error);
-bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QStringList &packages, QString *error);
-bool applyRemotePlan(RemoteLink *link, const QByteArray &helper, const QByteArray &plan, QString *error, QString *output);
+bool installRemotePackages(RemoteLink *link, const OsProfile &profile, const QStringList &packages, QString *error,
+                           const QString &sudoPassword = {});
+bool applyRemotePlan(RemoteLink *link, const QByteArray &helper, const QByteArray &plan, QString *error, QString *output,
+                     const QString &sudoPassword = {});

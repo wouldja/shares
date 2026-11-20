@@ -1417,6 +1417,22 @@ ApplicationWindow {
             spacing: 10
             Text { text: "Needed on " + backend.hostTitle; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
             Text { width: 444; wrapMode: Text.Wrap; text: backend.needsText; color: "#a1a3ad"; font.family: win.font.family }
+            TextField {
+                id: sudoPasswordField
+                visible: backend.sudoPasswordNeeded
+                width: 444
+                placeholderText: "Sudo password (not saved)"
+                placeholderTextColor: "#7e8089"
+                color: "#a1a3ad"
+                font.family: win.font.family
+                echoMode: TextInput.Password
+                inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                onAccepted: {
+                    if (backend.setSudoPassword(text))
+                        text = ""
+                }
+            }
             Text {
                 visible: backend.error !== ""
                 width: 444
@@ -1429,6 +1445,14 @@ ApplicationWindow {
             }
             Row {
                 spacing: 8
+                ActionButton {
+                    label: "Use password"
+                    visible: backend.sudoPasswordNeeded
+                    onActivated: {
+                        if (backend.setSudoPassword(sudoPasswordField.text))
+                            sudoPasswordField.text = ""
+                    }
+                }
                 ActionButton { label: "Install"; primary: true; visible: backend.canInstall; onActivated: { if (backend.installNeeds()) win.needsOpen = false } }
                 ActionButton { label: "Not now"; onActivated: win.needsOpen = false }
                 ActionButton { label: "Disconnect"; visible: backend.remote; onActivated: win.requestDisconnect() }
