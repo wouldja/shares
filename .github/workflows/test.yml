@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt 6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            python3 \
+            qmake6 \
+            qt6-base-dev \
+            qt6-declarative-dev \
+            qt6-qpa-plugins
+
+      - name: Check Python helpers
+        run: python3 -m py_compile src/shares_apply.py src/mount_share.py
+
+      - name: Build
+        run: bin/build
+
+      - name: Test
+        run: bin/test

@@ -105,7 +105,7 @@ bin/build
 ./build/shares
 ```
 
-Run the tests with `bin/test`.
+Run the tests with `bin/test`. GitHub runs that, and `bin/build`, on each push and pull request. It also checks `src/shares_apply.py` and `src/mount_share.py`.
 
 The build needs `base-devel`, `qt6-base`, `qt6-declarative`, and `qt6-wayland`. Omarchy already includes these. If `qmake6` is missing:
 
