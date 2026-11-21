@@ -11,6 +11,8 @@
 #include <QVariant>
 #include <memory>
 
+struct WindowsBridge;
+
 // smbclient -g -L lines. Disk shares stay; IPC and Windows admin shares do not.
 QVariantList parseSmbGrepableList(const QString &output);
 
@@ -21,8 +23,32 @@ QStringList lanIpv4Hosts(const QString &address, int prefix, QString *error);
 // A Tailscale address and a network that is too large are left out.
 QStringList hostsFromIpAddr(const QString &output, bool remoteComputer, QString *error);
 
+// Online peers from `tailscale status --json`. This computer, offline peers,
+// and anything that is not a plain IPv4 address are left out.
+QStringList tailscaleIpv4Hosts(const QString &json);
+
+// Those addresses, plus the connected computer when this session is Tailscale
+// and its address is not already listed. Sorted as IPv4.
+QStringList tailnetScanHosts(const QString &statusJson, const QString &connectVia, const QString &connectAddress);
+
 // python3 -c script. Credentials and host names travel on stdin, not in this argv.
 QStringList remoteSmbListArgv();
+
+// smb://host/share, with the share name encoded. A port other than 445 is
+// included. Empty when either part is empty or the port is not usable.
+QString smbShareLocation(const QString &host, const QString &name, int port = 445);
+
+// Enabled Samba shares to mount at one Tailscale address. Disabled shares and
+// Windows admin shares are left out. An empty or unusable address returns nothing.
+QVariantList publishedWindowsShares(const QVector<SambaShare> &shares, const QString &address);
+
+// OpenSSH argv that forwards stdin to a private IPv4 SMB port through a peer.
+// The program is ssh, and -W is before user@peer. Tailscale SSH adds its nc
+// proxy and known_hosts file. A password is never an argument. Empty when the
+// target is not safe to dial.
+QStringList windowsShareTunnelArgs(bool tailscaleSsh, bool withPassword, const QString &user, const QString &peer,
+                                   int sshPort, const QString &lanHost, int smbPort, const QString &knownHostsFile,
+                                   const QString &tailscaleProgram);
 
 // stdout from that script. oneHost is a typed server; otherwise it was a network scan.
 struct RemoteSmbScan {
@@ -75,10 +101,13 @@ class Backend : public QObject {
     Q_PROPERTY(QString smbStatus READ smbStatus NOTIFY smbChanged)
     Q_PROPERTY(QString smbError READ smbError NOTIFY smbChanged)
     Q_PROPERTY(QVariantList smbShares READ smbShares NOTIFY smbChanged)
+    Q_PROPERTY(QString connectVia READ connectVia NOTIFY hostChanged)
+    Q_PROPERTY(QString connectAddress READ connectAddress NOTIFY hostChanged)
 
 public:
     explicit Backend(const QString &root = {}, Commands *commands = nullptr, FilePicker *picker = nullptr,
                      RemoteLink *link = nullptr, QObject *parent = nullptr);
+    ~Backend() override;
 
     int protocol() const { return m_protocol; }
     QString protocolName() const;
@@ -120,6 +149,8 @@ public:
     QString smbStatus() const { return m_smbStatus; }
     QString smbError() const { return m_smbError; }
     QVariantList smbShares() const { return m_smbShares; }
+    QString connectVia() const { return m_connectVia; }
+    QString connectAddress() const { return m_connectAddress; }
     void setHostsFile(const QString &path);
 
     Q_INVOKABLE void setProtocol(int protocol);
@@ -158,7 +189,11 @@ public:
     Q_INVOKABLE void clearSmbShares();
     Q_INVOKABLE void discoverSmbShares(const QString &host, const QString &user, const QString &password);
     Q_INVOKABLE void scanSmbNetwork(const QString &user, const QString &password);
-    Q_INVOKABLE bool openSmbShare(int index);
+    Q_INVOKABLE bool openSmbShare(int index, const QString &user = {}, const QString &password = {});
+    // Mount this computer's published Samba shares at its Tailscale address.
+    // Does nothing unless the open connection is Tailscale. A scripted test
+    // link does not start mounts.
+    Q_INVOKABLE void connectPublishedWindows(const QString &user = {}, const QString &password = {});
     Q_INVOKABLE bool leaveComputer();
     Q_INVOKABLE bool installNeeds();
     Q_INVOKABLE bool setSudoPassword(const QString &password);
@@ -265,6 +300,17 @@ private:
     void useLocal();
     QString localUser() const;
     RemoteHost hostById(const QString &id) const;
+    void stopWindowsForwards(bool notify);
+    void finishSmbQuery(const QVariantList &shares, const QString &error, const QString &user, const QString &password,
+                        bool mountAfter);
+    void connectDiscoveredWindows(const QVariantList &shares, const QString &user, const QString &password);
+    void mountDiscoveredWindows(const QVariantList &shares, const QStringList &reachable, const QString &user,
+                                const QString &password);
+    void rememberWindowsMount(const QVariantMap &mount);
+    void startQuietMount(const QVariantMap &mount, const QString &user, const QString &password);
+    void republishSmbShares();
+    void noteWindowsProgress();
+    QString windowsMountKey(const QString &host, const QString &name) const;
 
     std::shared_ptr<Commands> m_owned;
     Commands *m_localCommands = nullptr;
@@ -291,6 +337,10 @@ private:
     QString m_pendingPassword;
     int m_pendingPort = 22;
     bool m_pendingTailscaleSsh = false;
+    QString m_pendingVia;
+    QString m_pendingAddress;
+    QString m_connectVia;
+    QString m_connectAddress;
     bool m_canInstall = false;
     // Held for this connection only. It is not written to the host file.
     QString m_sudoPassword;
@@ -303,8 +353,15 @@ private:
     QString m_smbError;
     QString m_smbStatus;
     QVariantList m_smbShares;
+    QVariantList m_smbDiscovered;
+    QHash<QString, QVariantMap> m_windowsMounts;
+    QStringList m_windowsMountOrder;
     int m_smbWave = 0;
+    int m_mountWave = 0;
     bool m_smbScanning = false;
+    // Incomplete on purpose. The forwarder is defined in backend.cpp, and this
+    // pointer is only deleted there.
+    WindowsBridge *m_windowsBridge = nullptr;
     QVariantList m_hostRows;
     bool m_tailscaleBusy = false;
     QVector<RemoteHost> m_saved;

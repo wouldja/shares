@@ -19,6 +19,7 @@
 #include <QPointer>
 #include <QSaveFile>
 #include <QProcess>
+#include <QSet>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryFile>
@@ -36,7 +37,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <utility>
+#include <vector>
+
+#include <spawn.h>
+#include <signal.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 namespace {
 
@@ -228,6 +239,172 @@ QStringList hostsFromIpAddr(const QString &output, bool remoteComputer, QString 
     if (error)
         error->clear();
     return hosts;
+}
+
+namespace {
+
+bool strictIpv4(const QString &host, quint32 *value = nullptr) {
+    const auto parts = host.split('.');
+    if (parts.size() != 4)
+        return false;
+    quint32 ip = 0;
+    for (const auto &part : parts) {
+        if (part.isEmpty() || (part.size() > 1 && part.startsWith(QLatin1Char('0'))))
+            return false;
+        bool ok = false;
+        const int number = part.toInt(&ok);
+        if (!ok || number < 0 || number > 255)
+            return false;
+        ip = (ip << 8) | quint32(number);
+    }
+    if (value)
+        *value = ip;
+    return true;
+}
+
+void sortIpv4(QStringList *hosts) {
+    std::sort(hosts->begin(), hosts->end(), [](const QString &left, const QString &right) {
+        quint32 a = 0;
+        quint32 b = 0;
+        strictIpv4(left, &a);
+        strictIpv4(right, &b);
+        return a < b;
+    });
+}
+
+} // namespace
+
+QStringList tailscaleIpv4Hosts(const QString &json) {
+    QStringList hosts;
+    for (const auto &peer : tailscalePeers(json)) {
+        const auto address = peer.address.trimmed();
+        if (!strictIpv4(address) || hosts.contains(address))
+            continue;
+        hosts.append(address);
+    }
+    sortIpv4(&hosts);
+    return hosts;
+}
+
+QStringList tailnetScanHosts(const QString &statusJson, const QString &connectVia, const QString &connectAddress) {
+    auto hosts = tailscaleIpv4Hosts(statusJson);
+    if (connectVia == QLatin1String("tailscale")) {
+        const auto address = connectAddress.trimmed();
+        if (strictIpv4(address) && !hosts.contains(address))
+            hosts.append(address);
+    }
+    sortIpv4(&hosts);
+    return hosts;
+}
+
+QString smbShareLocation(const QString &host, const QString &name, int port) {
+    if (host.isEmpty() || name.isEmpty() || port < 0 || port > 65535)
+        return {};
+    QUrl url;
+    url.setScheme(QStringLiteral("smb"));
+    url.setHost(host);
+    if (port > 0 && port != 445)
+        url.setPort(port);
+    url.setPath(QStringLiteral("/") + name);
+    return url.toString(QUrl::FullyEncoded);
+}
+
+namespace {
+
+bool shareHostOk(const QString &host) {
+    static const QRegularExpression re("^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$");
+    return re.match(host).hasMatch() && !host.contains(QStringLiteral("..")) && !host.endsWith('.');
+}
+
+// RFC1918 only. A Tailscale address is reached directly, not forwarded.
+bool privateLanIpv4(const QString &host) {
+    const auto parts = host.split('.');
+    if (parts.size() != 4)
+        return false;
+    int octets[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        const auto &part = parts.at(i);
+        if (part.isEmpty() || (part.size() > 1 && part.startsWith(QLatin1Char('0'))))
+            return false;
+        bool ok = false;
+        const int number = part.toInt(&ok);
+        if (!ok || number < 0 || number > 255)
+            return false;
+        octets[i] = number;
+    }
+    if (octets[0] == 10)
+        return true;
+    if (octets[0] == 192 && octets[1] == 168)
+        return true;
+    return octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31;
+}
+
+bool tunnelFileOk(const QString &path) {
+    if (!path.startsWith('/') || path.contains('\n') || path.contains('\r') || path.contains('"') || path.contains('\''))
+        return false;
+    return true;
+}
+
+bool tunnelProgramOk(const QString &program) {
+    static const QRegularExpression re("^[A-Za-z0-9_./+-]+$");
+    return re.match(program).hasMatch();
+}
+
+QString knownHostsOption(const QString &path) {
+    if (path.contains(' '))
+        return QStringLiteral("UserKnownHostsFile=\"") + path + QLatin1Char('"');
+    return QStringLiteral("UserKnownHostsFile=") + path;
+}
+
+} // namespace
+
+QVariantList publishedWindowsShares(const QVector<SambaShare> &shares, const QString &address) {
+    const auto host = address.trimmed();
+    if (!shareHostOk(host))
+        return {};
+    QVariantList listed;
+    for (const auto &share : shares) {
+        if (!share.enabled || share.name.isEmpty() || windowsAdminShare(share.name))
+            continue;
+        listed.append(QVariantMap{{QStringLiteral("name"), share.name},
+                                  {QStringLiteral("comment"), share.comment},
+                                  {QStringLiteral("host"), host}});
+    }
+    return listed;
+}
+
+QStringList windowsShareTunnelArgs(bool tailscaleSsh, bool withPassword, const QString &user, const QString &peer,
+                                   int sshPort, const QString &lanHost, int smbPort, const QString &knownHostsFile,
+                                   const QString &tailscaleProgram) {
+    // A password session is OpenSSH, not `tailscale ssh`. Extra arguments on
+    // `tailscale ssh` land after the destination, so -W would be a remote command.
+    const bool proxy = tailscaleSsh && !withPassword;
+    if (!remoteTargetOk(user, peer, sshPort) || !privateLanIpv4(lanHost) || smbPort < 1 || smbPort > 65535)
+        return {};
+    if (proxy && (!tunnelFileOk(knownHostsFile) || !tunnelProgramOk(tailscaleProgram)))
+        return {};
+    QStringList args{QStringLiteral("ssh"),
+                     QStringLiteral("-W"),
+                     lanHost + QLatin1Char(':') + QString::number(smbPort),
+                     QStringLiteral("-T"),
+                     QStringLiteral("-p"),
+                     QString::number(sshPort),
+                     QStringLiteral("-o")};
+    if (withPassword) {
+        args << QStringLiteral("BatchMode=no") << QStringLiteral("-o") << QStringLiteral("PubkeyAuthentication=no")
+             << QStringLiteral("-o") << QStringLiteral("PreferredAuthentications=password,keyboard-interactive")
+             << QStringLiteral("-o") << QStringLiteral("NumberOfPasswordPrompts=1");
+    } else {
+        args << QStringLiteral("BatchMode=yes");
+    }
+    args << QStringLiteral("-o") << QStringLiteral("ConnectTimeout=8") << QStringLiteral("-o")
+         << QStringLiteral("ClearAllForwardings=yes") << QStringLiteral("-o") << QStringLiteral("StrictHostKeyChecking=yes");
+    if (proxy) {
+        args << QStringLiteral("-o") << knownHostsOption(knownHostsFile) << QStringLiteral("-o")
+             << QStringLiteral("ProxyCommand=") + tailscaleProgram + QStringLiteral(" nc %h %p");
+    }
+    args << user + QLatin1Char('@') + peer;
+    return args;
 }
 
 QStringList remoteSmbListArgv() {
@@ -781,6 +958,33 @@ QString parentPath(const QString &path) {
         return path;
     const auto slash = path.lastIndexOf('/');
     return slash > 0 ? path.left(slash) : QStringLiteral("/");
+}
+
+struct ListedSmbScan {
+    QVariantList shares;
+    QString error;
+};
+
+// Port 445 is checked here. smbclient runs only for a host that answered.
+ListedSmbScan scanHostsForSmb(const QStringList &hosts, const QString &user, const QString &password,
+                              const QString &noneFound) {
+    ListedSmbScan result;
+    const auto servers = hostsWithSmb(hosts);
+    if (servers.isEmpty()) {
+        result.error = noneFound;
+        return result;
+    }
+    for (const auto &host : servers) {
+        const auto one = scanSmbShares(host, user, password, 8000);
+        for (const auto &share : one.shares) {
+            auto map = share.toMap();
+            map.insert(QStringLiteral("host"), host);
+            result.shares.append(map);
+        }
+    }
+    if (result.shares.isEmpty())
+        result.error = QStringLiteral("SMB servers answered, but none listed a visible share. Try a username and password.");
+    return result;
 }
 
 } // namespace
@@ -2768,6 +2972,8 @@ bool Backend::beginConnect(const RemoteHost &host) {
     m_pendingPassword = target.password;
     m_pendingPort = target.port;
     m_pendingTailscaleSsh = target.tailscaleSsh;
+    m_pendingVia = target.via;
+    m_pendingAddress = target.address;
     const auto label = target.name.isEmpty() ? target.host : target.name;
     m_hostTitle = QStringLiteral("Connecting to %1").arg(label);
     m_notice = QStringLiteral("Reading the share files.");
@@ -2839,6 +3045,8 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
     m_pendingPassword = result.host.password;
     m_pendingPort = result.host.port;
     m_pendingTailscaleSsh = result.host.tailscaleSsh;
+    m_pendingVia = result.host.via;
+    m_pendingAddress = result.host.address;
     m_connecting = false;
     if (!result.need.connected) {
         // A failed first connection has no mirror. A failed switch leaves the
@@ -2849,6 +3057,8 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
             m_commands = m_localCommands;
             m_library.setCommands(m_commands);
             m_hostTitle = QStringLiteral("This computer");
+            m_connectVia.clear();
+            m_connectAddress.clear();
         } else {
             m_hostTitle = m_restoreTitle.isEmpty() ? QStringLiteral("This computer") : m_restoreTitle;
         }
@@ -2882,6 +3092,8 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
     m_root = m_mirror->path();
     m_remoteProfile = result.need.profile;
     m_hostTitle = result.host.name.isEmpty() ? result.host.host : result.host.name;
+    m_connectVia = result.host.via;
+    m_connectAddress = result.host.address.trimmed().isEmpty() ? result.host.host : result.host.address.trimmed();
     m_neededPackages = result.need.packages;
     m_canInstall = result.need.sudo && !result.need.packages.isEmpty();
     m_sudoPasswordNeeded = !result.need.sudo;
@@ -2899,6 +3111,8 @@ void Backend::applyConnect(const ConnectResult &result, const std::shared_ptr<Re
     if (!m_needsText.isEmpty())
         emit needsReady();
     emit hostChanged();
+    // Drop the previous computer's mounts only after this connection is up.
+    stopWindowsForwards(true);
     emit computerReady();
 }
 
@@ -2957,6 +3171,9 @@ void Backend::useLocal() {
     m_root = m_appRoot;
     m_hostTitle = QStringLiteral("This computer");
     m_pendingPassword.clear();
+    m_connectVia.clear();
+    m_connectAddress.clear();
+    stopWindowsForwards(true);
     m_sudoPassword.clear();
     m_sudoPasswordNeeded = false;
     m_needsText.clear();
@@ -3012,6 +3229,8 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     m_pendingPassword = target.password;
     m_pendingPort = target.port;
     m_pendingTailscaleSsh = target.tailscaleSsh;
+    m_pendingVia = target.via;
+    m_pendingAddress = target.address;
     const auto need = probeRemote(m_link);
     if (!need.connected) {
         m_canTrustHost = need.hostKeyDenied;
@@ -3033,6 +3252,8 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
     m_library.setProfile(need.profile);
     m_remoteProfile = need.profile;
     m_hostTitle = target.name.isEmpty() ? target.host : target.name;
+    m_connectVia = target.via;
+    m_connectAddress = target.address.trimmed().isEmpty() ? target.host : target.address.trimmed();
     m_neededPackages = need.packages;
     m_canInstall = need.sudo && !need.packages.isEmpty();
     m_sudoPasswordNeeded = !need.sudo;
@@ -3048,6 +3269,7 @@ bool Backend::connectRemoteUser(const RemoteHost &host) {
         setError(need.error);
     if (!m_needsText.isEmpty())
         emit needsReady();
+    stopWindowsForwards(true);
     emit computerReady();
     return true;
 }
@@ -3170,6 +3392,7 @@ void Backend::clearSmbShares() {
     m_smbHost.clear();
     m_smbError.clear();
     m_smbStatus.clear();
+    m_smbDiscovered.clear();
     m_smbShares.clear();
     m_smbScanning = false;
     emit smbChanged();
@@ -3203,6 +3426,7 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     const auto user = userName.trimmed();
     if (!smbHostOk(host)) {
         m_smbError = QStringLiteral("Enter a host name or IPv4 address.");
+        m_smbDiscovered.clear();
         m_smbShares.clear();
         m_smbStatus.clear();
         m_smbScanning = false;
@@ -3212,6 +3436,7 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     const auto credentialError = smbCredentialError(user, password);
     if (!credentialError.isEmpty()) {
         m_smbError = credentialError;
+        m_smbDiscovered.clear();
         m_smbShares.clear();
         m_smbStatus.clear();
         m_smbScanning = false;
@@ -3220,19 +3445,22 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
     }
 
     const int wave = ++m_smbWave;
+    const int mountWave = m_mountWave;
     m_smbHost = host;
     m_smbError.clear();
-    m_smbShares.clear();
+    m_smbDiscovered.clear();
     m_smbStatus = remote() ? QStringLiteral("Looking for SMB shares from %1…").arg(m_hostTitle)
                            : QStringLiteral("Looking for SMB shares…");
     m_smbScanning = true;
+    republishSmbShares();
     emit smbChanged();
 
     QPointer<Backend> self(this);
     const bool onRemote = remote() && m_link;
+    const bool mountAfter = onRemote && m_connectVia == QLatin1String("tailscale") && !m_injectedLink;
     auto kept = m_linkShared;
     RemoteLink *link = m_link;
-    QThreadPool::globalInstance()->start([host, user, password, wave, self, onRemote, kept, link] {
+    QThreadPool::globalInstance()->start([host, user, password, wave, mountWave, mountAfter, self, onRemote, kept, link] {
         Q_UNUSED(kept);
         auto result = onRemote ? listRemoteSmb(link, {host}, user, password, true, 20000) : [&] {
             auto local = scanSmbShares(host, user, password);
@@ -3251,14 +3479,16 @@ void Backend::discoverSmbShares(const QString &hostName, const QString &userName
             return;
         QMetaObject::invokeMethod(
             app,
-            [self, wave, result] {
+            [self, wave, mountWave, mountAfter, result, user, password] {
                 if (!self || wave != self->m_smbWave)
                     return;
-                self->m_smbScanning = false;
-                self->m_smbStatus.clear();
-                self->m_smbShares = result.shares;
-                self->m_smbError = result.error;
-                emit self->smbChanged();
+                if (mountWave != self->m_mountWave) {
+                    self->m_smbScanning = false;
+                    self->m_smbStatus.clear();
+                    emit self->smbChanged();
+                    return;
+                }
+                self->finishSmbQuery(result.shares, result.error, user, password, mountAfter);
             },
             Qt::QueuedConnection);
     });
@@ -3269,6 +3499,7 @@ void Backend::scanSmbNetwork(const QString &userName, const QString &password) {
     const auto credentialError = smbCredentialError(user, password);
     if (!credentialError.isEmpty()) {
         m_smbError = credentialError;
+        m_smbDiscovered.clear();
         m_smbShares.clear();
         m_smbStatus.clear();
         m_smbScanning = false;
@@ -3276,22 +3507,47 @@ void Backend::scanSmbNetwork(const QString &userName, const QString &password) {
         return;
     }
 
-    const int wave = ++m_smbWave;
-    m_smbHost.clear();
-    m_smbError.clear();
-    m_smbShares.clear();
     const bool onRemote = remote() && m_link;
-    m_smbStatus = onRemote ? QStringLiteral("Scanning %1's local network for SMB and Samba…").arg(m_hostTitle)
-                           : QStringLiteral("Scanning this computer's local network for SMB and Samba…");
+    // A plain SSH session still scans that computer's private LAN. Tailscale
+    // addresses are reachable from here, so those are probed on this computer.
+    const bool plainSsh = onRemote && m_connectVia != QLatin1String("tailscale");
+    const auto tailnetHosts = plainSsh ? QStringList{}
+                                       : tailnetScanHosts(m_library.tailscaleStatus, m_connectVia, m_connectAddress);
+    const bool tailnet = !plainSsh && !tailnetHosts.isEmpty();
+    const bool mountAfter = onRemote && m_connectVia == QLatin1String("tailscale") && !m_injectedLink;
+
+    const int wave = ++m_smbWave;
+    const int mountWave = m_mountWave;
+    m_smbHost.clear();
+    m_smbDiscovered.clear();
+    m_smbError.clear();
+    if (onRemote && !plainSsh && !tailnet) {
+        m_smbStatus.clear();
+        m_smbScanning = false;
+        m_smbError = QStringLiteral("Tailscale has no addresses to scan.");
+        republishSmbShares();
+        emit smbChanged();
+        return;
+    }
+    if (tailnet)
+        m_smbStatus = QStringLiteral("Scanning the Tailscale network for SMB and Samba…");
+    else if (onRemote)
+        m_smbStatus = QStringLiteral("Scanning %1's local network for SMB and Samba…").arg(m_hostTitle);
+    else
+        m_smbStatus = QStringLiteral("Scanning this computer's local network for SMB and Samba…");
     m_smbScanning = true;
+    republishSmbShares();
     emit smbChanged();
 
     QPointer<Backend> self(this);
     auto kept = m_linkShared;
     RemoteLink *link = m_link;
-    QThreadPool::globalInstance()->start([user, password, wave, self, onRemote, kept, link] {
+    const auto noneFound = tailnet ? QStringLiteral("No SMB or Samba servers were found on the Tailscale network.")
+                                   : QStringLiteral("No SMB or Samba servers were found on the local network.");
+    QThreadPool::globalInstance()->start([user, password, wave, mountWave, mountAfter, self, plainSsh, tailnet, tailnetHosts,
+                                          noneFound, kept, link] {
         Q_UNUSED(kept);
-        if (onRemote) {
+        if (plainSsh) {
             QString planError;
             QVariantList shares;
             const auto addr = link->exec({QStringLiteral("ip"), QStringLiteral("-4"), QStringLiteral("-o"),
@@ -3311,85 +3567,818 @@ void Backend::scanSmbNetwork(const QString &userName, const QString &password) {
                 return;
             QMetaObject::invokeMethod(
                 app,
-                [self, wave, shares, planError] {
+                [self, wave, mountWave, mountAfter, shares, planError, user, password] {
                     if (!self || wave != self->m_smbWave)
                         return;
-                    self->m_smbScanning = false;
-                    self->m_smbStatus.clear();
-                    self->m_smbShares = shares;
-                    self->m_smbError = planError;
-                    emit self->smbChanged();
+                    if (mountWave != self->m_mountWave) {
+                        self->m_smbScanning = false;
+                        self->m_smbStatus.clear();
+                        emit self->smbChanged();
+                        return;
+                    }
+                    self->finishSmbQuery(shares, planError, user, password, mountAfter);
                 },
                 Qt::QueuedConnection);
             return;
         }
         QString planError;
-        const auto hosts = planLanHosts(&planError);
+        auto hosts = tailnetHosts;
+        if (!tailnet)
+            hosts = planLanHosts(&planError);
         QVariantList shares;
         QString error = planError;
-        if (!hosts.isEmpty()) {
-            const auto servers = hostsWithSmb(hosts);
-            if (servers.isEmpty()) {
-                error = QStringLiteral("No SMB or Samba servers were found on the local network.");
-            } else {
-                for (const auto &host : servers) {
-                    const auto result = scanSmbShares(host, user, password, 8000);
-                    for (const auto &share : result.shares) {
-                        auto map = share.toMap();
-                        map.insert(QStringLiteral("host"), host);
-                        shares.append(map);
-                    }
-                }
-                if (shares.isEmpty())
-                    error = QStringLiteral("SMB servers answered, but none listed a visible share. Try a username and password.");
-                else
-                    error.clear();
-            }
+        if (planError.isEmpty()) {
+            const auto listed = scanHostsForSmb(hosts, user, password, noneFound);
+            shares = listed.shares;
+            error = listed.error;
         }
         auto *app = QCoreApplication::instance();
         if (!app)
             return;
         QMetaObject::invokeMethod(
             app,
-            [self, wave, shares, error] {
+            [self, wave, mountWave, mountAfter, shares, error, user, password] {
                 if (!self || wave != self->m_smbWave)
                     return;
-                self->m_smbScanning = false;
-                self->m_smbStatus.clear();
-                self->m_smbShares = shares;
-                self->m_smbError = error;
+                if (mountWave != self->m_mountWave) {
+                    self->m_smbScanning = false;
+                    self->m_smbStatus.clear();
+                    emit self->smbChanged();
+                    return;
+                }
+                self->finishSmbQuery(shares, error, user, password, mountAfter);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+namespace {
+
+// Folio opens a local folder. An smb:// address has no registered app, and
+// the portal then says no apps are available. GVfs mounts the share and
+// prints the folder every file manager can open.
+struct MountedShare {
+    QString folder;
+    QString error;
+};
+
+MountedShare mountSmbShare(const QString &location, const QString &user, const QString &password, bool noPrompt) {
+    QFile helper(QStringLiteral(":/mount_share.py"));
+    if (!helper.open(QIODevice::ReadOnly))
+        return {{}, QStringLiteral("Could not open the share.")};
+    if (QStandardPaths::findExecutable(QStringLiteral("python3")).isEmpty())
+        return {{}, QStringLiteral("Could not open the share. python3 is not installed.")};
+    QTemporaryFile script(QDir::temp().filePath(QStringLiteral("shares-mount-XXXXXX.py")));
+    script.setAutoRemove(true);
+    if (!script.open())
+        return {{}, QStringLiteral("Could not open the share.")};
+    const auto body = helper.readAll();
+    if (script.write(body) != body.size())
+        return {{}, QStringLiteral("Could not open the share.")};
+    script.flush();
+    QProcess process;
+    process.setProcessChannelMode(QProcess::SeparateChannels);
+    auto env = QProcessEnvironment::systemEnvironment();
+    // The password stays in this process. It is not a command argument.
+    if (!user.isEmpty())
+        env.insert(QStringLiteral("SHARES_SMB_USER"), user);
+    if (!password.isEmpty())
+        env.insert(QStringLiteral("SHARES_SMB_PASSWORD"), password);
+    if (noPrompt)
+        env.insert(QStringLiteral("SHARES_SMB_NO_PROMPT"), QStringLiteral("1"));
+    process.setProcessEnvironment(env);
+    process.start(QStringLiteral("python3"), {script.fileName(), location});
+    if (!process.waitForStarted(5000))
+        return {{}, QStringLiteral("Could not open the share.")};
+    // The password dialog, when the server asks, stays up until it is answered.
+    if (!process.waitForFinished(50000)) {
+        process.kill();
+        process.waitForFinished(1000);
+        return {{}, QStringLiteral("Opening the share timed out.")};
+    }
+    const auto folder = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+    const auto error = QString::fromUtf8(process.readAllStandardError()).trimmed();
+    if (process.exitCode() != 0 || folder.isEmpty() || !folder.startsWith(QStringLiteral("/")))
+        return {{}, error.isEmpty() ? QStringLiteral("Could not open the share.") : error};
+    return {folder, {}};
+}
+
+bool openFolder(const QString &folder) {
+    const auto folio = QStandardPaths::findExecutable(QStringLiteral("folio"));
+    if (!folio.isEmpty() && QProcess::startDetached(folio, {folder}))
+        return true;
+    const auto nautilus = QStandardPaths::findExecutable(QStringLiteral("nautilus"));
+    if (!nautilus.isEmpty() && QProcess::startDetached(nautilus, {QStringLiteral("--new-window"), folder}))
+        return true;
+    return QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
+}
+
+} // namespace
+
+bool Backend::openSmbShare(int index, const QString &user, const QString &password) {
+    if (index < 0 || index >= m_smbShares.size())
+        return false;
+    const auto credentialError = smbCredentialError(user, password);
+    if (!credentialError.isEmpty()) {
+        m_smbError = credentialError;
+        emit smbChanged();
+        return false;
+    }
+    const auto share = m_smbShares.at(index).toMap();
+    const auto name = share.value(QStringLiteral("name")).toString();
+    const auto host = share.value(QStringLiteral("host")).toString().isEmpty() ? m_smbHost
+                                                                                : share.value(QStringLiteral("host")).toString();
+    const auto stored = share.value(QStringLiteral("location")).toString();
+    const auto location = stored.isEmpty() ? smbShareLocation(host, name) : stored;
+    if (location.isEmpty())
+        return false;
+    const auto folder = share.value(QStringLiteral("mountFolder")).toString();
+    if (share.value(QStringLiteral("mounted")).toBool() && folder.startsWith('/') && QFileInfo::exists(folder)) {
+        m_smbError.clear();
+        if (m_smbStatus.startsWith(QStringLiteral("Opening ")))
+            m_smbStatus.clear();
+        if (!openFolder(folder))
+            m_smbError = QStringLiteral("The share is mounted, but the file manager did not open.");
+        emit smbChanged();
+        return m_smbError.isEmpty();
+    }
+    m_smbError.clear();
+    m_smbStatus = QStringLiteral("Opening %1…").arg(name);
+    emit smbChanged();
+
+    const int wave = ++m_smbWave;
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([location, name, user, password, wave, self] {
+        const auto mounted = mountSmbShare(location, user, password, false);
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app,
+            [self, wave, name, mounted] {
+                if (!self || wave != self->m_smbWave)
+                    return;
+                if (self->m_smbStatus == QStringLiteral("Opening %1…").arg(name))
+                    self->m_smbStatus.clear();
+                if (mounted.folder.isEmpty()) {
+                    const auto cancelled = mounted.error.contains(QStringLiteral("cancel"), Qt::CaseInsensitive)
+                        || mounted.error.contains(QStringLiteral("abort"), Qt::CaseInsensitive);
+                    self->m_smbError = cancelled ? QString() : mounted.error;
+                    emit self->smbChanged();
+                    return;
+                }
+                if (!openFolder(mounted.folder))
+                    self->m_smbError = QStringLiteral("The share is mounted, but the file manager did not open.");
+                emit self->smbChanged();
+            },
+            Qt::QueuedConnection);
+    });
+    return true;
+}
+
+namespace {
+
+QString quietMountError(const QString &error) {
+    const auto lower = error.toLower();
+    const bool needs = lower.contains(QStringLiteral("password")) || lower.contains(QStringLiteral("logon"))
+        || lower.contains(QStringLiteral("auth")) || lower.contains(QStringLiteral("credential"))
+        || lower.contains(QStringLiteral("access denied")) || lower.contains(QStringLiteral("login"))
+        || lower.contains(QStringLiteral("permission"));
+    if (needs)
+        return QStringLiteral("Needs a password.");
+    return error.isEmpty() ? QStringLiteral("Could not connect to the share.") : error;
+}
+
+void copyStream(int from, int to) {
+    char buffer[16384];
+    while (true) {
+        const ssize_t n = ::read(from, buffer, sizeof buffer);
+        if (n == 0)
+            break;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        ssize_t off = 0;
+        while (off < n) {
+            const ssize_t wrote = ::write(to, buffer + off, static_cast<size_t>(n - off));
+            if (wrote < 0) {
+                if (errno == EINTR)
+                    continue;
+                ::shutdown(to, SHUT_WR);
+                return;
+            }
+            if (wrote == 0) {
+                ::shutdown(to, SHUT_WR);
+                return;
+            }
+            off += wrote;
+        }
+    }
+    ::shutdown(to, SHUT_WR);
+}
+
+struct SpawnedStdio {
+    int fd = -1;
+    pid_t pid = -1;
+};
+
+SpawnedStdio spawnSshStdio(const QStringList &args, const QProcessEnvironment *env) {
+    SpawnedStdio spawned;
+    if (args.isEmpty())
+        return spawned;
+    int pair[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
+        return spawned;
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        ::close(pair[0]);
+        ::close(pair[1]);
+        return spawned;
+    }
+    const int devnull = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    posix_spawn_file_actions_adddup2(&actions, pair[1], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, pair[1], STDOUT_FILENO);
+    if (devnull >= 0)
+        posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pair[0]);
+    posix_spawn_file_actions_addclose(&actions, pair[1]);
+    if (devnull >= 0)
+        posix_spawn_file_actions_addclose(&actions, devnull);
+
+    QVector<QByteArray> storage;
+    storage.reserve(args.size());
+    for (const auto &arg : args)
+        storage.append(arg.toUtf8());
+    QVector<char *> argv;
+    argv.reserve(storage.size() + 1);
+    for (auto &item : storage)
+        argv.append(item.data());
+    argv.append(nullptr);
+
+    QVector<QByteArray> envStorage;
+    QVector<char *> envp;
+    char **envPtr = ::environ;
+    if (env) {
+        const auto lines = env->toStringList();
+        envStorage.reserve(lines.size());
+        for (const auto &line : lines)
+            envStorage.append(line.toUtf8());
+        envp.reserve(envStorage.size() + 1);
+        for (auto &item : envStorage)
+            envp.append(item.data());
+        envp.append(nullptr);
+        envPtr = envp.isEmpty() ? ::environ : envp.data();
+    }
+
+    pid_t pid = -1;
+    const int rc = ::posix_spawnp(&pid, argv.at(0), &actions, nullptr, argv.data(), envPtr);
+    posix_spawn_file_actions_destroy(&actions);
+    if (devnull >= 0)
+        ::close(devnull);
+    ::close(pair[1]);
+    if (rc != 0 || pid <= 0) {
+        ::close(pair[0]);
+        return spawned;
+    }
+    spawned.fd = pair[0];
+    spawned.pid = pid;
+    return spawned;
+}
+
+int listenLoopback(int *port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    const int yes = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0 || ::listen(fd, 16) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    sockaddr_in bound{};
+    socklen_t length = sizeof bound;
+    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&bound), &length) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    *port = ntohs(bound.sin_port);
+    return fd;
+}
+
+struct ForwardConn {
+    int client = -1;
+    int remote = -1;
+    pid_t pid = -1;
+    std::thread thread;
+    std::atomic<bool> done{false};
+    bool joined = false;
+};
+
+// One local port per LAN server. Each accepted SMB connection gets its own
+// `ssh -W`, because -W forwards the one stdio stream of that process.
+class WindowsForward {
+public:
+    WindowsForward(QStringList args, QProcessEnvironment env, bool haveEnv)
+        : m_args(std::move(args)), m_env(std::move(env)), m_haveEnv(haveEnv) {
+        m_listen = listenLoopback(&m_port);
+        if (m_listen < 0)
+            return;
+        m_accept = std::thread([this] { acceptLoop(); });
+    }
+
+    ~WindowsForward() { stop(); }
+
+    bool ok() const { return m_listen >= 0 && m_port > 0; }
+    int port() const { return m_port; }
+
+    void stop() {
+        m_stop.store(true);
+        if (m_listen >= 0)
+            ::shutdown(m_listen, SHUT_RDWR);
+        if (m_accept.joinable())
+            m_accept.join();
+        std::vector<std::shared_ptr<ForwardConn>> conns;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            conns.swap(m_conns);
+            for (const auto &conn : conns) {
+                if (conn->client >= 0)
+                    ::shutdown(conn->client, SHUT_RDWR);
+                if (conn->remote >= 0)
+                    ::shutdown(conn->remote, SHUT_RDWR);
+                if (conn->pid > 0)
+                    ::kill(conn->pid, SIGTERM);
+            }
+        }
+        for (const auto &conn : conns)
+            joinConn(conn);
+        if (m_listen >= 0) {
+            ::close(m_listen);
+            m_listen = -1;
+        }
+    }
+
+private:
+    void joinConn(const std::shared_ptr<ForwardConn> &conn) {
+        bool join = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            if (!conn->joined) {
+                conn->joined = true;
+                join = true;
+            }
+        }
+        if (join && conn->thread.joinable())
+            conn->thread.join();
+    }
+
+    void reapFinished() {
+        std::vector<std::shared_ptr<ForwardConn>> finished;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            std::vector<std::shared_ptr<ForwardConn>> live;
+            for (const auto &conn : m_conns) {
+                if (conn->done.load() && !conn->joined) {
+                    conn->joined = true;
+                    finished.push_back(conn);
+                } else {
+                    live.push_back(conn);
+                }
+            }
+            m_conns.swap(live);
+        }
+        for (const auto &conn : finished) {
+            if (conn->thread.joinable())
+                conn->thread.join();
+        }
+    }
+
+    int liveCount() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        int count = 0;
+        for (const auto &conn : m_conns) {
+            if (!conn->done.load())
+                ++count;
+        }
+        return count;
+    }
+
+    void runConn(const std::shared_ptr<ForwardConn> &conn) {
+        std::thread inbound([conn] { copyStream(conn->remote, conn->client); });
+        copyStream(conn->client, conn->remote);
+        if (inbound.joinable())
+            inbound.join();
+        int client = -1;
+        int remote = -1;
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            client = conn->client;
+            remote = conn->remote;
+            pid = conn->pid;
+            conn->client = -1;
+            conn->remote = -1;
+            conn->pid = -1;
+        }
+        if (client >= 0)
+            ::close(client);
+        if (remote >= 0)
+            ::close(remote);
+        if (pid > 0) {
+            ::kill(pid, SIGTERM);
+            ::waitpid(pid, nullptr, 0);
+        }
+        conn->done.store(true);
+    }
+
+    void acceptLoop() {
+        while (!m_stop.load()) {
+            reapFinished();
+            pollfd ready{};
+            ready.fd = m_listen;
+            ready.events = POLLIN;
+            if (::poll(&ready, 1, 200) <= 0 || m_stop.load())
+                continue;
+            const int client = ::accept4(m_listen, nullptr, nullptr, SOCK_CLOEXEC);
+            if (client < 0)
+                continue;
+            if (liveCount() >= 64) {
+                ::close(client);
+                continue;
+            }
+            const auto spawned = spawnSshStdio(m_args, m_haveEnv ? &m_env : nullptr);
+            if (spawned.fd < 0) {
+                ::close(client);
+                continue;
+            }
+            auto conn = std::make_shared<ForwardConn>();
+            conn->client = client;
+            conn->remote = spawned.fd;
+            conn->pid = spawned.pid;
+            conn->thread = std::thread([this, conn] { runConn(conn); });
+            std::lock_guard<std::mutex> lock(m_mu);
+            m_conns.push_back(conn);
+        }
+        reapFinished();
+    }
+
+    QStringList m_args;
+    QProcessEnvironment m_env;
+    bool m_haveEnv = false;
+    int m_listen = -1;
+    int m_port = 0;
+    std::atomic<bool> m_stop{false};
+    std::mutex m_mu;
+    std::thread m_accept;
+    std::vector<std::shared_ptr<ForwardConn>> m_conns;
+};
+
+QString tailscaleKnownHostsFile() {
+    const auto home = QDir::homePath();
+    if (home.isEmpty())
+        return {};
+    return home + QStringLiteral("/.config/tailscale/ssh_known_hosts");
+}
+
+QString tailscaleProgramPath() {
+    const auto found = QStandardPaths::findExecutable(QStringLiteral("tailscale"));
+    return found.isEmpty() ? QStringLiteral("tailscale") : found;
+}
+
+} // namespace
+
+struct WindowsBridge {
+    QHash<QString, std::shared_ptr<WindowsForward>> byHost;
+};
+
+Backend::~Backend() { stopWindowsForwards(false); }
+
+QString Backend::windowsMountKey(const QString &host, const QString &name) const {
+    return host + QLatin1Char('\n') + name;
+}
+
+void Backend::stopWindowsForwards(bool notify) {
+    ++m_mountWave;
+    m_windowsMounts.clear();
+    m_windowsMountOrder.clear();
+    m_smbDiscovered.clear();
+    m_smbShares.clear();
+    m_smbScanning = false;
+    m_smbStatus.clear();
+    m_smbError.clear();
+    delete m_windowsBridge;
+    m_windowsBridge = nullptr;
+    if (notify)
+        emit smbChanged();
+}
+
+void Backend::rememberWindowsMount(const QVariantMap &mount) {
+    const auto host = mount.value(QStringLiteral("host")).toString();
+    const auto name = mount.value(QStringLiteral("name")).toString();
+    if (host.isEmpty() || name.isEmpty())
+        return;
+    const auto key = windowsMountKey(host, name);
+    if (!m_windowsMountOrder.contains(key))
+        m_windowsMountOrder.append(key);
+    auto stored = mount;
+    stored.insert(QStringLiteral("key"), key);
+    m_windowsMounts.insert(key, stored);
+}
+
+void Backend::republishSmbShares() {
+    QSet<QString> seen;
+    QVariantList rows;
+    for (const auto &share : m_smbDiscovered) {
+        auto map = share.toMap();
+        const auto key = windowsMountKey(map.value(QStringLiteral("host")).toString(), map.value(QStringLiteral("name")).toString());
+        seen.insert(key);
+        if (m_windowsMounts.contains(key)) {
+            const auto mount = m_windowsMounts.value(key);
+            map.insert(QStringLiteral("mounting"), mount.value(QStringLiteral("mounting")));
+            map.insert(QStringLiteral("mounted"), mount.value(QStringLiteral("mounted")));
+            map.insert(QStringLiteral("mountError"), mount.value(QStringLiteral("mountError")));
+            map.insert(QStringLiteral("mountFolder"), mount.value(QStringLiteral("mountFolder")));
+            map.insert(QStringLiteral("location"), mount.value(QStringLiteral("location")));
+        }
+        rows.append(map);
+    }
+    for (const auto &key : m_windowsMountOrder) {
+        if (!seen.contains(key) && m_windowsMounts.contains(key))
+            rows.append(m_windowsMounts.value(key));
+    }
+    m_smbShares = rows;
+}
+
+void Backend::noteWindowsProgress() {
+    if (m_smbScanning || m_windowsMounts.isEmpty())
+        return;
+    int mounting = 0;
+    int mounted = 0;
+    int needs = 0;
+    int failed = 0;
+    for (auto it = m_windowsMounts.cbegin(); it != m_windowsMounts.cend(); ++it) {
+        const auto &row = it.value();
+        if (row.value(QStringLiteral("mounting")).toBool())
+            ++mounting;
+        else if (row.value(QStringLiteral("mounted")).toBool())
+            ++mounted;
+        else if (row.value(QStringLiteral("mountError")).toString() == QStringLiteral("Needs a password."))
+            ++needs;
+        else
+            ++failed;
+    }
+    if (mounting > 0) {
+        const int total = m_windowsMounts.size();
+        m_smbStatus = total == 1 ? QStringLiteral("Connecting to 1 Windows share over Tailscale…")
+                                 : QStringLiteral("Connecting to %1 Windows shares over Tailscale…").arg(total);
+        return;
+    }
+    QStringList parts;
+    if (mounted > 0)
+        parts << (mounted == 1 ? QStringLiteral("1 connected") : QStringLiteral("%1 connected").arg(mounted));
+    if (needs > 0)
+        parts << (needs == 1 ? QStringLiteral("1 needs a password") : QStringLiteral("%1 need a password").arg(needs));
+    if (failed > 0)
+        parts << (failed == 1 ? QStringLiteral("1 failed") : QStringLiteral("%1 failed").arg(failed));
+    m_smbStatus = parts.join(QStringLiteral(", "));
+}
+
+void Backend::startQuietMount(const QVariantMap &mount, const QString &user, const QString &password) {
+    const auto key = mount.value(QStringLiteral("key")).toString();
+    const auto location = mount.value(QStringLiteral("location")).toString();
+    if (key.isEmpty() || !location.startsWith(QStringLiteral("smb://")))
+        return;
+    const int wave = m_mountWave;
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([self, key, location, user, password, wave] {
+        const auto mounted = mountSmbShare(location, user, password, true);
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app,
+            [self, key, wave, mounted] {
+                if (!self || wave != self->m_mountWave || !self->m_windowsMounts.contains(key))
+                    return;
+                auto row = self->m_windowsMounts.value(key);
+                row.insert(QStringLiteral("mounting"), false);
+                if (mounted.folder.isEmpty()) {
+                    row.insert(QStringLiteral("mounted"), false);
+                    row.insert(QStringLiteral("mountError"), quietMountError(mounted.error));
+                    row.insert(QStringLiteral("mountFolder"), QString());
+                } else {
+                    row.insert(QStringLiteral("mounted"), true);
+                    row.insert(QStringLiteral("mountError"), QString());
+                    row.insert(QStringLiteral("mountFolder"), mounted.folder);
+                }
+                self->m_windowsMounts.insert(key, row);
+                if (!self->m_smbScanning)
+                    self->noteWindowsProgress();
+                self->republishSmbShares();
                 emit self->smbChanged();
             },
             Qt::QueuedConnection);
     });
 }
 
-bool Backend::openSmbShare(int index) {
-    if (index < 0 || index >= m_smbShares.size())
-        return false;
-    const auto share = m_smbShares.at(index).toMap();
-    const auto name = share.value(QStringLiteral("name")).toString();
-    const auto host = share.value(QStringLiteral("host")).toString().isEmpty() ? m_smbHost
-                                                                                : share.value(QStringLiteral("host")).toString();
-    if (name.isEmpty() || host.isEmpty())
-        return false;
-    QUrl url;
-    url.setScheme(QStringLiteral("smb"));
-    url.setHost(host);
-    url.setPath(QStringLiteral("/") + name);
-    const auto location = url.toString(QUrl::FullyEncoded);
-    // This desktop has no smb:// handler, so Nautilus has to be asked directly.
-    const auto nautilus = QStandardPaths::findExecutable(QStringLiteral("nautilus"));
-    if (!nautilus.isEmpty() && QProcess::startDetached(nautilus, {QStringLiteral("--new-window"), location}))
-        return true;
-    if (QDesktopServices::openUrl(url))
-        return true;
-    const auto gio = QStandardPaths::findExecutable(QStringLiteral("gio"));
-    if (!gio.isEmpty() && QProcess::startDetached(gio, {QStringLiteral("open"), location}))
-        return true;
-    m_smbError = QStringLiteral("Could not open the share. Install a file manager with SMB support (gvfs-smb on Arch).");
+void Backend::finishSmbQuery(const QVariantList &shares, const QString &error, const QString &user, const QString &password,
+                             bool mountAfter) {
+    m_smbScanning = false;
+    m_smbStatus.clear();
+    m_smbDiscovered = shares;
+    m_smbError = error;
+    republishSmbShares();
+    noteWindowsProgress();
     emit smbChanged();
-    return false;
+    if (mountAfter && remote() && m_connectVia == QLatin1String("tailscale") && !m_injectedLink)
+        connectDiscoveredWindows(shares, user, password);
+}
+
+void Backend::connectPublishedWindows(const QString &user, const QString &password) {
+    if (!remote() || m_connectVia != QLatin1String("tailscale"))
+        return;
+    // Unit tests inject a scripted link. Mounting would start real gvfs and ssh.
+    if (m_injectedLink)
+        return;
+    const auto login = user.trimmed();
+    const auto credentialError = smbCredentialError(login, password);
+    if (!credentialError.isEmpty()) {
+        m_smbError = credentialError;
+        emit smbChanged();
+        return;
+    }
+    constexpr int cap = 24;
+    int added = 0;
+    for (const auto &share : publishedWindowsShares(m_samba.shares, m_connectAddress)) {
+        auto map = share.toMap();
+        const auto name = map.value(QStringLiteral("name")).toString();
+        const auto host = map.value(QStringLiteral("host")).toString();
+        if (m_windowsMounts.contains(windowsMountKey(host, name)))
+            continue;
+        const auto location = smbShareLocation(host, name);
+        if (location.isEmpty())
+            continue;
+        map.insert(QStringLiteral("location"), location);
+        map.insert(QStringLiteral("mounted"), false);
+        map.insert(QStringLiteral("mountFolder"), QString());
+        if (added >= cap) {
+            map.insert(QStringLiteral("mounting"), false);
+            map.insert(QStringLiteral("mountError"), QStringLiteral("Too many shares to connect at once."));
+            rememberWindowsMount(map);
+            continue;
+        }
+        map.insert(QStringLiteral("mounting"), true);
+        map.insert(QStringLiteral("mountError"), QString());
+        rememberWindowsMount(map);
+        startQuietMount(m_windowsMounts.value(windowsMountKey(host, name)), login, password);
+        ++added;
+    }
+    if (added == 0 && m_windowsMounts.isEmpty())
+        return;
+    noteWindowsProgress();
+    republishSmbShares();
+    emit smbChanged();
+}
+
+void Backend::connectDiscoveredWindows(const QVariantList &shares, const QString &user, const QString &password) {
+    if (!remote() || m_connectVia != QLatin1String("tailscale") || m_injectedLink)
+        return;
+    QVariantList pending;
+    QStringList hosts;
+    for (const auto &share : shares) {
+        const auto map = share.toMap();
+        const auto name = map.value(QStringLiteral("name")).toString();
+        const auto host = map.value(QStringLiteral("host")).toString();
+        if (name.isEmpty() || host.isEmpty() || windowsAdminShare(name))
+            continue;
+        if (m_windowsMounts.contains(windowsMountKey(host, name)))
+            continue;
+        pending.append(map);
+        if (!hosts.contains(host))
+            hosts.append(host);
+    }
+    if (pending.isEmpty())
+        return;
+    const int wave = m_mountWave;
+    QPointer<Backend> self(this);
+    QThreadPool::globalInstance()->start([self, pending, hosts, user, password, wave] {
+        const auto open = hostsWithSmb(hosts);
+        auto *app = QCoreApplication::instance();
+        if (!app)
+            return;
+        QMetaObject::invokeMethod(
+            app,
+            [self, pending, open, user, password, wave] {
+                if (!self || wave != self->m_mountWave || !self->remote() || self->m_connectVia != QLatin1String("tailscale"))
+                    return;
+                self->mountDiscoveredWindows(pending, open, user, password);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void Backend::mountDiscoveredWindows(const QVariantList &shares, const QStringList &reachable, const QString &user,
+                                    const QString &password) {
+    if (!m_windowsBridge)
+        m_windowsBridge = new WindowsBridge;
+    const bool withPassword = !m_pendingPassword.isEmpty();
+    const bool tailscaleSsh = m_pendingTailscaleSsh && !withPassword;
+    QProcessEnvironment env;
+    QString askError;
+    if (withPassword) {
+        const auto askpass = sshAskpassProgram(&askError);
+        if (askpass.isEmpty()) {
+            for (const auto &share : shares) {
+                auto map = share.toMap();
+                map.insert(QStringLiteral("mounting"), false);
+                map.insert(QStringLiteral("mounted"), false);
+                map.insert(QStringLiteral("mountError"),
+                           askError.isEmpty() ? QStringLiteral("Could not prepare the password prompt.") : askError);
+                rememberWindowsMount(map);
+            }
+            noteWindowsProgress();
+            republishSmbShares();
+            emit smbChanged();
+            return;
+        }
+        env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("SSH_ASKPASS"), askpass);
+        env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("force"));
+        env.insert(QStringLiteral("SHARES_SSH_PASSWORD"), m_pendingPassword);
+        if (env.value(QStringLiteral("DISPLAY")).isEmpty())
+            env.insert(QStringLiteral("DISPLAY"), QStringLiteral(":0"));
+    }
+    const auto knownHosts = tailscaleKnownHostsFile();
+    const auto program = tailscaleProgramPath();
+    QHash<QString, int> localPorts;
+    QHash<QString, QString> forwardErrors;
+    constexpr int cap = 24;
+    int added = 0;
+    for (const auto &share : shares) {
+        auto map = share.toMap();
+        const auto name = map.value(QStringLiteral("name")).toString();
+        const auto host = map.value(QStringLiteral("host")).toString();
+        if (m_windowsMounts.contains(windowsMountKey(host, name)))
+            continue;
+        if (added >= cap) {
+            map.insert(QStringLiteral("mounting"), false);
+            map.insert(QStringLiteral("mounted"), false);
+            map.insert(QStringLiteral("mountError"), QStringLiteral("Too many shares to connect at once."));
+            map.insert(QStringLiteral("mountFolder"), QString());
+            map.insert(QStringLiteral("location"), QString());
+            rememberWindowsMount(map);
+            continue;
+        }
+        QString location;
+        QString error;
+        const bool direct = reachable.contains(host) || !privateLanIpv4(host);
+        if (direct) {
+            location = smbShareLocation(host, name);
+            if (location.isEmpty())
+                error = QStringLiteral("Could not connect to the share.");
+        } else if (forwardErrors.contains(host)) {
+            error = forwardErrors.value(host);
+        } else if (localPorts.contains(host)) {
+            location = smbShareLocation(QStringLiteral("127.0.0.1"), name, localPorts.value(host));
+        } else {
+            const auto args = windowsShareTunnelArgs(tailscaleSsh, withPassword, m_pendingUser, m_pendingHost, m_pendingPort, host,
+                                                     445, knownHosts, program);
+            auto forward = args.isEmpty() ? std::shared_ptr<WindowsForward>()
+                                          : std::make_shared<WindowsForward>(args, env, withPassword);
+            if (!forward || !forward->ok()) {
+                error = QStringLiteral("Could not forward that share.");
+                forwardErrors.insert(host, error);
+            } else {
+                m_windowsBridge->byHost.insert(host, forward);
+                localPorts.insert(host, forward->port());
+                location = smbShareLocation(QStringLiteral("127.0.0.1"), name, forward->port());
+            }
+        }
+        map.insert(QStringLiteral("mounted"), false);
+        map.insert(QStringLiteral("mountFolder"), QString());
+        if (location.isEmpty()) {
+            map.insert(QStringLiteral("mounting"), false);
+            map.insert(QStringLiteral("mountError"), error.isEmpty() ? QStringLiteral("Could not connect to the share.") : error);
+            map.insert(QStringLiteral("location"), QString());
+            rememberWindowsMount(map);
+            continue;
+        }
+        map.insert(QStringLiteral("location"), location);
+        map.insert(QStringLiteral("mounting"), true);
+        map.insert(QStringLiteral("mountError"), QString());
+        rememberWindowsMount(map);
+        startQuietMount(m_windowsMounts.value(windowsMountKey(host, name)), user, password);
+        ++added;
+    }
+    noteWindowsProgress();
+    republishSmbShares();
+    emit smbChanged();
 }
 
 bool Backend::leaveComputer() {
@@ -3478,6 +4467,8 @@ bool Backend::trustHost() {
     host.port = m_pendingPort;
     host.password = m_pendingPassword;
     host.tailscaleSsh = m_pendingTailscaleSsh;
+    host.via = m_pendingVia;
+    host.address = m_pendingAddress;
     host.name = m_pendingHost.section('.', 0, 0);
     return connectRemote(host);
 }

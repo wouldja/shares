@@ -1,6 +1,9 @@
 #include "remote.h"
 
+#include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
@@ -13,11 +16,40 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QUrl>
 
 #include <algorithm>
 #include <utility>
 
+QString tailscaleAuthUrl(const QString &text) {
+    if (!text.contains(QStringLiteral("Tailscale SSH requires an additional check")))
+        return {};
+    static const QRegularExpression link(QStringLiteral(R"(https://login\.tailscale\.com/a/[A-Za-z0-9]+)"));
+    const auto match = link.match(text);
+    return match.hasMatch() ? match.captured(0) : QString();
+}
+
 namespace {
+
+// The check stays open until the browser visit finishes. Open that page once
+// and keep this SSH session up so the connection can continue afterwards.
+void openTailscaleCheck(const QString &url) {
+    const QUrl parsed(url);
+    if (parsed.scheme() != QStringLiteral("https") || parsed.host() != QStringLiteral("login.tailscale.com"))
+        return;
+    auto *app = QCoreApplication::instance();
+    if (!app)
+        return;
+    QMetaObject::invokeMethod(
+        app, [parsed] {
+            if (!QDesktopServices::openUrl(parsed)) {
+                const auto opener = QStandardPaths::findExecutable(QStringLiteral("xdg-open"));
+                if (!opener.isEmpty())
+                    QProcess::startDetached(opener, {parsed.toString()});
+            }
+        },
+        Qt::QueuedConnection);
+}
 
 CommandResult runProcess(const QString &program, const QStringList &args, const QString &input, int timeoutMs,
                          const QProcessEnvironment *env = nullptr) {
@@ -32,13 +64,43 @@ CommandResult runProcess(const QString &program, const QStringList &args, const 
     if (!input.isEmpty())
         process.write(input.toUtf8());
     process.closeWriteChannel();
-    if (!process.waitForFinished(timeoutMs)) {
-        process.kill();
-        process.waitForFinished(1000);
-        return {124, {}, "timed out", false};
+    QByteArray outBytes;
+    QByteArray errBytes;
+    bool openedCheck = false;
+    QElapsedTimer timer;
+    timer.start();
+    int budget = timeoutMs;
+    while (!process.waitForFinished(200)) {
+        outBytes += process.readAllStandardOutput();
+        errBytes += process.readAllStandardError();
+        if (!openedCheck) {
+            const auto url = tailscaleAuthUrl(QString::fromUtf8(errBytes) + QString::fromUtf8(outBytes));
+            if (!url.isEmpty()) {
+                openedCheck = true;
+                budget = qMax(budget, int(timer.elapsed()) + 180000);
+                openTailscaleCheck(url);
+            }
+        }
+        if (timer.elapsed() >= budget) {
+            process.kill();
+            process.waitForFinished(1000);
+            outBytes += process.readAllStandardOutput();
+            errBytes += process.readAllStandardError();
+            const auto url = tailscaleAuthUrl(QString::fromUtf8(errBytes) + QString::fromUtf8(outBytes));
+            if (!url.isEmpty())
+                return {124, QString::fromUtf8(outBytes),
+                        QStringLiteral("Tailscale SSH needs a check in the browser.\n") + url, false};
+            return {124, {}, QStringLiteral("timed out"), false};
+        }
     }
-    return {process.exitCode(), QString::fromUtf8(process.readAllStandardOutput()),
-            QString::fromUtf8(process.readAllStandardError()), false};
+    outBytes += process.readAllStandardOutput();
+    errBytes += process.readAllStandardError();
+    if (!openedCheck && process.exitCode() != 0) {
+        const auto url = tailscaleAuthUrl(QString::fromUtf8(errBytes) + QString::fromUtf8(outBytes));
+        if (!url.isEmpty())
+            openTailscaleCheck(url);
+    }
+    return {process.exitCode(), QString::fromUtf8(outBytes), QString::fromUtf8(errBytes), false};
 }
 
 // One shell argument. A single quote inside becomes the usual '\'' sequence,

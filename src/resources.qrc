@@ -2,5 +2,6 @@
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
         <file alias="shares_apply.py">shares_apply.py</file>
+        <file alias="mount_share.py">mount_share.py</file>
     </qresource>
 </RCC>

@@ -1071,6 +1071,17 @@ private slots:
         QVERIFY(!password.join(' ').contains("n0t-st0red"));
     }
 
+    void tailscaleCheckUrlIsTheLoginLink() {
+        const auto text = QStringLiteral("# Tailscale SSH requires an additional check.\n"
+                                          "# To authenticate, visit: https://login.tailscale.com/a/l506e24e382d2b\n");
+        QCOMPARE(tailscaleAuthUrl(text), QString("https://login.tailscale.com/a/l506e24e382d2b"));
+        QVERIFY(tailscaleAuthUrl(QStringLiteral("https://login.tailscale.com/a/abc")).isEmpty());
+        QVERIFY(tailscaleAuthUrl(QStringLiteral("Tailscale SSH requires an additional check.\n"
+                                                "https://evil.example/a/abc"))
+                    .isEmpty());
+        QVERIFY(tailscaleAuthUrl(QString()).isEmpty());
+    }
+
     void tailscaleLoginRemembersTheUserNotThePassword() {
         QTemporaryDir dir;
         const auto hosts = dir.path() + "/hosts.json";
@@ -1184,6 +1195,185 @@ private slots:
         QVERIFY(error.contains(QStringLiteral("no other computers")));
     }
 
+    void smbShareLocationEncodesTheShareName() {
+        QCOMPARE(smbShareLocation("files.local", "photos"), QString("smb://files.local/photos"));
+        QCOMPARE(smbShareLocation("192.168.1.20", "My Photos"), QString("smb://192.168.1.20/My%20Photos"));
+        QCOMPARE(smbShareLocation("files.local", "Project#1"), QString("smb://files.local/Project%231"));
+        QCOMPARE(smbShareLocation("files.local", "photos", 445), QString("smb://files.local/photos"));
+        QCOMPARE(smbShareLocation("127.0.0.1", "photos", 4459), QString("smb://127.0.0.1:4459/photos"));
+        QVERIFY(smbShareLocation("", "photos").isEmpty());
+        QVERIFY(smbShareLocation("files.local", "").isEmpty());
+        QVERIFY(smbShareLocation("files.local", "photos", 70000).isEmpty());
+    }
+
+    void publishedWindowsSharesSkipDisabledAndAdminShares() {
+        SambaShare photos;
+        photos.name = QStringLiteral("photos");
+        photos.comment = QStringLiteral("Pictures");
+        SambaShare disabled;
+        disabled.name = QStringLiteral("secret");
+        disabled.enabled = false;
+        SambaShare drive;
+        drive.name = QStringLiteral("C$");
+        SambaShare ipc;
+        ipc.name = QStringLiteral("IPC$");
+        SambaShare backup;
+        backup.name = QStringLiteral("zfsback1$");
+        backup.comment = QStringLiteral("ZFS backup");
+        const auto listed = publishedWindowsShares({photos, disabled, drive, ipc, backup}, QStringLiteral("100.67.31.127"));
+        QCOMPARE(listed.size(), 2);
+        QCOMPARE(listed.at(0).toMap().value("name").toString(), QString("photos"));
+        QCOMPARE(listed.at(0).toMap().value("comment").toString(), QString("Pictures"));
+        QCOMPARE(listed.at(0).toMap().value("host").toString(), QString("100.67.31.127"));
+        QCOMPARE(listed.at(1).toMap().value("name").toString(), QString("zfsback1$"));
+        QVERIFY(publishedWindowsShares({photos}, {}).isEmpty());
+        QVERIFY(publishedWindowsShares({photos}, QStringLiteral("not a host")).isEmpty());
+    }
+
+    void windowsShareTunnelPutsTheForwardBeforeThePeer() {
+        const auto known = QStringLiteral("/home/brian/.config/tailscale/ssh_known_hosts");
+        const auto args = windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                                 QStringLiteral("192.168.1.20"), 445, known, QStringLiteral("tailscale"));
+        QCOMPARE(args,
+                 QStringList({QStringLiteral("ssh"),
+                              QStringLiteral("-W"),
+                              QStringLiteral("192.168.1.20:445"),
+                              QStringLiteral("-T"),
+                              QStringLiteral("-p"),
+                              QStringLiteral("22"),
+                              QStringLiteral("-o"),
+                              QStringLiteral("BatchMode=yes"),
+                              QStringLiteral("-o"),
+                              QStringLiteral("ConnectTimeout=8"),
+                              QStringLiteral("-o"),
+                              QStringLiteral("ClearAllForwardings=yes"),
+                              QStringLiteral("-o"),
+                              QStringLiteral("StrictHostKeyChecking=yes"),
+                              QStringLiteral("-o"),
+                              QStringLiteral("UserKnownHostsFile=/home/brian/.config/tailscale/ssh_known_hosts"),
+                              QStringLiteral("-o"),
+                              QStringLiteral("ProxyCommand=tailscale nc %h %p"),
+                              QStringLiteral("root@bandc")}));
+        QCOMPARE(args.last(), QString("root@bandc"));
+        QVERIFY(args.indexOf(QStringLiteral("-W")) < args.indexOf(QStringLiteral("root@bandc")));
+        QVERIFY(!args.join('\n').contains(QStringLiteral("s3cret")));
+
+        const auto spaced = windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                                   QStringLiteral("192.168.1.20"), 445,
+                                                   QStringLiteral("/home/brian smith/.config/tailscale/ssh_known_hosts"),
+                                                   QStringLiteral("/usr/bin/tailscale"));
+        QVERIFY(spaced.contains(QStringLiteral("UserKnownHostsFile=\"/home/brian smith/.config/tailscale/ssh_known_hosts\"")));
+        QVERIFY(spaced.contains(QStringLiteral("ProxyCommand=/usr/bin/tailscale nc %h %p")));
+        QCOMPARE(spaced.last(), QString("root@bandc"));
+
+        const auto password = windowsShareTunnelArgs(true, true, QStringLiteral("ada"), QStringLiteral("files.example"), 22,
+                                                     QStringLiteral("10.1.2.3"), 445, known, QStringLiteral("tailscale"));
+        QVERIFY(!password.join('\n').contains(QStringLiteral("tailscale")));
+        QVERIFY(!password.join('\n').contains(QStringLiteral("s3cret")));
+        QVERIFY(password.contains(QStringLiteral("BatchMode=no")));
+        QVERIFY(password.contains(QStringLiteral("PubkeyAuthentication=no")));
+        QCOMPARE(password.at(password.indexOf(QStringLiteral("-W")) + 1), QString("10.1.2.3:445"));
+        QCOMPARE(password.last(), QString("ada@files.example"));
+
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("192.168.1.5;id"), 445, known, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("8.8.8.8"), 445, known, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("100.67.31.127"), 445, known, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("127.0.0.1"), 445, known, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bad host"), 22,
+                                       QStringLiteral("192.168.1.20"), 445, known, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("Root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("192.168.1.20"), 445, known, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("192.168.1.20"), 445, {}, QStringLiteral("tailscale"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(true, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("192.168.1.20"), 445, known, QStringLiteral("tailscale;id"))
+                    .isEmpty());
+        QVERIFY(windowsShareTunnelArgs(false, false, QStringLiteral("root"), QStringLiteral("bandc"), 22,
+                                       QStringLiteral("172.16.0.9"), 445, {}, {})
+                    .last()
+                == QString("root@bandc"));
+    }
+
+    void connectPublishedWindowsDoesNothingOffTheTailnet() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json", {0, "{}", {}, false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        const auto smb = QByteArray("[global]\n   workgroup = WORKGROUP\n[photos]\n   path = /srv/photos\n   comment = Pictures\n");
+        link.exact.insert(remoteBundleArgv().join(' '),
+                          {0, QString::fromUtf8(remoteBundlePayload({{QStringLiteral("/etc/samba/smb.conf"), smb}})), {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        QVERIFY(backend.addHost("root", "files.example.net", 22));
+        QVERIFY(backend.remote());
+        QCOMPARE(backend.connectVia(), QString("ssh"));
+        const auto calls = link.calls.size();
+        backend.connectPublishedWindows("ada", "secret");
+        QCOMPARE(link.calls.size(), calls);
+        QVERIFY(backend.smbShares().isEmpty());
+        QVERIFY(backend.smbStatus().isEmpty());
+        QVERIFY(backend.smbError().isEmpty());
+
+        Backend local(dir.path() + "/local", &commands);
+        local.connectPublishedWindows();
+        QVERIFY(local.smbShares().isEmpty());
+        QVERIFY(!local.remote());
+    }
+
+    void tailscaleConnectDoesNotMountThroughAScriptedLink() {
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert(
+            "tailscale status --json",
+            {0,
+             QString(R"({"Self":{"DNSName":"omacrown.example.ts.net."},"Peer":{"bandc":{"HostName":"bandc","DNSName":"bandc.example.ts.net.","Online":true,"TailscaleIPs":["100.100.100.2"],"sshHostKeys":["ssh-ed25519 AAAA"]}}})"),
+             {},
+             false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        const auto smb = QByteArray("[global]\n   workgroup = WORKGROUP\n[photos]\n   path = /srv/photos\n   comment = Pictures\n");
+        link.exact.insert(remoteBundleArgv().join(' '),
+                          {0, QString::fromUtf8(remoteBundlePayload({{QStringLiteral("/etc/samba/smb.conf"), smb}})), {}, false});
+        Backend backend(dir.path(), &commands, nullptr, &link);
+        backend.setHostsFile(dir.path() + "/hosts.json");
+        backend.refreshHosts();
+        QString id;
+        for (const auto &row : backend.hosts()) {
+            if (row.toMap().value("name").toString() == "bandc")
+                id = row.toMap().value("id").toString();
+        }
+        QVERIFY(id.startsWith("ts:"));
+        QVERIFY(backend.useHost(id, "root"));
+        QVERIFY(backend.remote());
+        QCOMPARE(backend.connectVia(), QString("tailscale"));
+        QCOMPARE(backend.connectAddress(), QString("100.100.100.2"));
+        bool sawPhotos = false;
+        for (const auto &row : backend.rows()) {
+            if (row.toMap().value("name").toString() == "photos")
+                sawPhotos = true;
+        }
+        QVERIFY(sawPhotos);
+        const auto calls = link.calls.size();
+        backend.connectPublishedWindows();
+        QCOMPARE(link.calls.size(), calls);
+        QVERIFY(backend.smbShares().isEmpty());
+        QVERIFY(backend.smbStatus().isEmpty());
+    }
+
     void smbDiscoveryRejectsABadRequestWithoutScanning() {
         QTemporaryDir dir;
         FakeCommands commands;
@@ -1208,6 +1398,127 @@ private slots:
         QVERIFY(backend.smbError().contains("line break"));
         QVERIFY(!backend.smbScanning());
         QVERIFY(backend.smbStatus().isEmpty());
+    }
+
+    void tailscaleScanUsesTailscaleAddresses() {
+        const auto json = QString(R"({
+            "Self": {"DNSName": "files.example.ts.net."},
+            "Peer": {
+                "self": {"HostName": "files", "DNSName": "files.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["100.100.100.1"]},
+                "pve": {"HostName": "pve", "DNSName": "pve.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["fd7a:115c:a1e0::2", "100.100.100.2"], "sshHostKeys": ["ssh-ed25519 AAAA"]},
+                "off": {"HostName": "off", "DNSName": "off.example.ts.net.", "Online": false,
+                    "TailscaleIPs": ["100.100.100.3"]},
+                "store": {"HostName": "store", "DNSName": "", "Online": true,
+                    "TailscaleIPs": ["100.100.100.4"]},
+                "zzz": {"HostName": "zzz", "DNSName": "zzz.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["100.64.1.5"]},
+                "copy": {"HostName": "copy", "DNSName": "copy.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["100.100.100.4"]},
+                "bad": {"HostName": "bad", "DNSName": "bad.example.ts.net.", "Online": true,
+                    "TailscaleIPs": ["100.100.100.02", "100.100.100.256"]}
+            }
+        })");
+        QCOMPARE(tailscaleIpv4Hosts(json), QStringList({"100.64.1.5", "100.100.100.2", "100.100.100.4"}));
+        QCOMPARE(tailnetScanHosts(json, "tailscale", "100.100.100.9"),
+                 QStringList({"100.64.1.5", "100.100.100.2", "100.100.100.4", "100.100.100.9"}));
+        QCOMPARE(tailnetScanHosts(json, "tailscale", "100.100.100.2"),
+                 QStringList({"100.64.1.5", "100.100.100.2", "100.100.100.4"}));
+        QCOMPARE(tailnetScanHosts(json, "ssh", "100.100.100.9"),
+                 QStringList({"100.64.1.5", "100.100.100.2", "100.100.100.4"}));
+        QCOMPARE(tailnetScanHosts(json, "tailscale", "pve.example.ts.net"),
+                 QStringList({"100.64.1.5", "100.100.100.2", "100.100.100.4"}));
+        QCOMPARE(tailnetScanHosts("{}", "tailscale", "100.1.2.3"), QStringList({"100.1.2.3"}));
+        QVERIFY(tailnetScanHosts("{}", "", "").isEmpty());
+
+        QTemporaryDir dir;
+        FakeCommands commands;
+        commands.exact.insert("tailscale status --json",
+                              {0,
+                               QString(R"({"Self":{"DNSName":"files.example.ts.net."},"Peer":{"docs":{"HostName":"docs","DNSName":"docs.example.ts.net.","Online":true,"TailscaleIPs":["192.0.2.1"]}}})"),
+                               {},
+                               false});
+        Backend backend(dir.path(), &commands);
+        backend.scanSmbNetwork("", "");
+        QVERIFY(backend.smbScanning());
+        QVERIFY(backend.smbStatus().contains(QStringLiteral("Tailscale")));
+        QTRY_VERIFY(!backend.smbScanning());
+        QCOMPARE(backend.smbError(), QString("No SMB or Samba servers were found on the Tailscale network."));
+        QVERIFY(backend.smbShares().isEmpty());
+        for (const auto &call : commands.calls)
+            QVERIFY(call.value(0) != "ip");
+
+        QTemporaryDir far;
+        FakeCommands farCommands;
+        farCommands.exact.insert(
+            "tailscale status --json",
+            {0,
+             QString(R"({"Self":{"DNSName":"files.example.ts.net."},"Peer":{"bandc":{"HostName":"bandc","DNSName":"bandc.example.ts.net.","Online":true,"TailscaleIPs":["192.0.2.1"],"sshHostKeys":["ssh-ed25519 AAAA"]}}})"),
+             {},
+             false});
+        ScriptedLink link;
+        link.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        link.exact.insert("sudo -n true", {0, {}, {}, false});
+        const auto smb = QByteArray("[global]\n   workgroup = WORKGROUP\n[photos]\n   path = /srv/photos\n");
+        link.exact.insert(remoteBundleArgv().join(' '),
+                          {0, QString::fromUtf8(remoteBundlePayload({{QStringLiteral("/etc/samba/smb.conf"), smb}})), {}, false});
+        Backend connected(far.path(), &farCommands, nullptr, &link);
+        connected.setHostsFile(far.path() + "/hosts.json");
+        QString id;
+        for (const auto &row : connected.hosts()) {
+            if (row.toMap().value("name").toString() == "bandc")
+                id = row.toMap().value("id").toString();
+        }
+        QVERIFY(id.startsWith("ts:"));
+        QVERIFY(connected.useHost(id, "root"));
+        QCOMPARE(connected.connectVia(), QString("tailscale"));
+        QCOMPARE(connected.connectAddress(), QString("192.0.2.1"));
+        int ipCalls = 0;
+        for (const auto &call : link.calls) {
+            if (call.value(0) == "ip")
+                ++ipCalls;
+        }
+        connected.scanSmbNetwork("", "");
+        QVERIFY(connected.smbStatus().contains(QStringLiteral("Tailscale")));
+        QTRY_VERIFY(!connected.smbScanning());
+        QCOMPARE(connected.smbError(), QString("No SMB or Samba servers were found on the Tailscale network."));
+        int ipCallsAfter = 0;
+        for (const auto &call : link.calls) {
+            if (call.value(0) == "ip")
+                ++ipCallsAfter;
+        }
+        QCOMPARE(ipCallsAfter, ipCalls);
+
+        QTemporaryDir named;
+        FakeCommands namedCommands;
+        namedCommands.exact.insert(
+            "tailscale status --json",
+            {0,
+             QString(R"({"Self":{"DNSName":"files.example.ts.net."},"Peer":{"nameonly":{"HostName":"nameonly","DNSName":"nameonly.example.ts.net.","Online":true,"TailscaleIPs":[],"sshHostKeys":["ssh-ed25519 AAAA"]}}})"),
+             {},
+             false});
+        ScriptedLink nameLink;
+        nameLink.exact.insert("cat /etc/os-release", {0, "ID=debian\nID_LIKE=debian\n", {}, false});
+        nameLink.exact.insert("sudo -n true", {0, {}, {}, false});
+        nameLink.exact.insert(remoteBundleArgv().join(' '),
+                              {0, QString::fromUtf8(remoteBundlePayload({{QStringLiteral("/etc/samba/smb.conf"), smb}})), {},
+                               false});
+        Backend noAddress(named.path(), &namedCommands, nullptr, &nameLink);
+        noAddress.setHostsFile(named.path() + "/hosts.json");
+        QString nameId;
+        for (const auto &row : noAddress.hosts()) {
+            if (row.toMap().value("name").toString() == "nameonly")
+                nameId = row.toMap().value("id").toString();
+        }
+        QVERIFY(nameId.startsWith("ts:"));
+        QVERIFY(noAddress.useHost(nameId, "root"));
+        QCOMPARE(noAddress.connectVia(), QString("tailscale"));
+        QCOMPARE(noAddress.connectAddress(), QString("nameonly.example.ts.net"));
+        noAddress.scanSmbNetwork("", "");
+        QVERIFY(!noAddress.smbScanning());
+        QCOMPARE(noAddress.smbError(), QString("Tailscale has no addresses to scan."));
+        QVERIFY(noAddress.smbShares().isEmpty());
     }
 
     void remoteLanScanUsesTheConnectedComputer() {

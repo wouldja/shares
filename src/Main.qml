@@ -19,6 +19,11 @@ ApplicationWindow {
     font.family: "JetBrainsMono NF"
     font.pixelSize: 12
 
+    Component.onCompleted: {
+        windowsScanWaiting = true
+        considerWindowsScan()
+    }
+
     property bool helpOpen: false
     property bool createOpen: false
     property bool removeOpen: false
@@ -28,14 +33,12 @@ ApplicationWindow {
     property bool importOpen: false
     property bool quitOpen: false
     property bool hostsOpen: false
-    property bool tailscaleOpen: false
-    property bool smbOpen: false
     property bool needsOpen: false
     property bool leaveOpen: false
+    property bool windowsScanWaiting: false
+    property bool windowsScanned: false
     property int hostCursor: 0
     property int hostFieldFocus: 0
-    property int tailCursor: -1
-    property int tailFieldFocus: 0
     property string peerEditId: ""
     property string peerEditUser: ""
     property string peerEditPassword: ""
@@ -54,8 +57,8 @@ ApplicationWindow {
         || hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus || hostPasswordField.activeFocus
         || smbHostField.activeFocus || smbUserField.activeFocus || smbPasswordField.activeFocus
         || remoteFolderField.activeFocus || remoteImageField.activeFocus
-        || hostFieldFocus > 0 || tailFieldFocus > 0
-    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || tailscaleOpen || smbOpen || needsOpen || leaveOpen
+        || hostFieldFocus > 0
+    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || needsOpen || leaveOpen
     property int browseCursor: 0
     readonly property bool letters: !overlay && !typing
 
@@ -69,10 +72,6 @@ ApplicationWindow {
         importOpen = false
         quitOpen = false
         hostsOpen = false
-        tailscaleOpen = false
-        tailFieldFocus = 0
-        backend.clearSmbShares()
-        smbOpen = false
         needsOpen = false
         leaveOpen = false
     }
@@ -80,11 +79,9 @@ ApplicationWindow {
     function requestDisconnect() {
         if (!backend.remote) {
             hostsOpen = false
-            tailscaleOpen = false
             return
         }
         hostsOpen = false
-        tailscaleOpen = false
         needsOpen = false
         helpOpen = false
         if (backend.canUndo) {
@@ -95,12 +92,14 @@ ApplicationWindow {
     }
 
     function finishDisconnect() {
+        windowsScanWaiting = false
         backend.leaveComputer()
         leaveOpen = false
         hostsOpen = false
-        tailscaleOpen = false
         needsOpen = false
         helpOpen = false
+        windowsScanWaiting = true
+        considerWindowsScan()
     }
 
     function saveAndLeave() {
@@ -229,7 +228,6 @@ ApplicationWindow {
     function openHosts() {
         backend.refreshHosts()
         hostCursor = 0
-        tailscaleOpen = false
         hostsOpen = true
     }
 
@@ -242,42 +240,65 @@ ApplicationWindow {
     }
 
     function openTailscale() {
-        backend.refreshHosts()
-        hostsOpen = false
-        tailscaleOpen = true
-        if (tailCursor < 0 || tailCursor >= backend.hosts.length || backend.hosts[tailCursor].via !== "tailscale")
-            tailCursor = firstTailscale()
+        openHosts()
+        var first = firstTailscale()
+        if (first >= 0)
+            hostCursor = first
     }
 
-    function moveTail(delta) {
-        var ids = []
-        for (var i = 0; i < backend.hosts.length; ++i) {
-            if (backend.hosts[i].via === "tailscale")
-                ids.push(i)
-        }
-        if (ids.length < 1)
-            return
-        var pos = ids.indexOf(tailCursor)
-        if (pos < 0)
-            pos = delta < 0 ? ids.length - 1 : 0
-        else
-            pos = (pos + delta + ids.length) % ids.length
-        tailCursor = ids[pos]
+    function windowsBusy() {
+        return backend.smbScanning || windowsScanWaiting
     }
 
-    function connectTail(index) {
-        if (index < 0 || index >= backend.hosts.length)
+    function windowsScanText() {
+        if (backend.connectVia === "tailscale" || (!backend.remote && tailscaleCount > 0))
+            return "Scanning the Tailscale network…"
+        if (backend.remote)
+            return "Scanning " + backend.hostTitle + "…"
+        return "Scanning this network…"
+    }
+
+    function scanWindowsShares() {
+        backend.scanSmbNetwork("", "")
+    }
+    function shareState(share) {
+        if (share.mounting)
+            return "connecting"
+        if (share.mounted)
+            return "connected"
+        return share.mountError || ""
+    }
+    function shareLine(share) {
+        var host = share.host || ""
+        var state = shareState(share)
+        if (host && state)
+            return host + " · " + state
+        return host || state
+    }
+    function shareDetail(share) {
+        var parts = []
+        if (share.host)
+            parts.push(share.host)
+        if (share.comment)
+            parts.push(share.comment)
+        var line = parts.join(" · ")
+        var state = shareState(share)
+        if (state)
+            return line ? line + " · " + state : state
+        return line
+    }
+
+    function considerWindowsScan() {
+        if (!windowsScanWaiting || backend.connecting)
             return
-        var row = backend.hosts[index]
-        if (!row || row.via !== "tailscale")
+        // Status arrives after the window opens. Scanning before that falls
+        // through to the private LAN, whose addresses this computer cannot mount.
+        if (backend.tailscaleBusy)
             return
-        tailCursor = index
-        if (peerEditId === row.id) {
-            backend.setHostLogin(row.id, peerEditUser, peerEditPassword)
-            backend.useHost(row.id, peerEditUser, peerEditPassword)
-        } else {
-            backend.useHost(row.id)
-        }
+        if (backend.subtitle.indexOf("checking") >= 0 || backend.foot.indexOf("checking") >= 0)
+            return
+        windowsScanWaiting = false
+        scanWindowsShares()
     }
 
     function moveHost(delta) {
@@ -296,22 +317,12 @@ ApplicationWindow {
     function connectTypedHost() {
         // The host box is a computer that is not in the list. An empty box
         // means the highlighted row, including its Tailscale user and password.
-        if (hostNameField.text.trim() === "" && hostCursor > 0 && hostCursor < backend.hosts.length) {
+        if (hostNameField.text.trim() === "" && hostCursor >= 0 && hostCursor < backend.hosts.length) {
             activateHost()
             return
         }
         backend.addHost(hostUserField.text, hostNameField.text, parseInt(hostPortField.text), hostPasswordField.text)
         hostPasswordField.text = ""
-    }
-
-    function openSmbBrowser() {
-        backend.clearSmbShares()
-        smbHostField.text = hostNameField.text
-        smbUserField.text = ""
-        smbPasswordField.text = ""
-        hostsOpen = false
-        smbOpen = true
-        smbHostField.forceActiveFocus()
     }
 
     function findSmbShares() {
@@ -376,12 +387,6 @@ ApplicationWindow {
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openCreate() }
     Shortcut { sequence: "H"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openHosts() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openTailscale() }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(1) }
-    Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(-1) }
-    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(1) }
-    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(-1) }
-    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: connectTail(tailCursor) }
-    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: connectTail(tailCursor) }
     Shortcut {
         sequence: "X"
         context: Qt.ApplicationShortcut
@@ -395,8 +400,8 @@ ApplicationWindow {
     Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
     Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(1) }
     Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: hostsOpen && !typing; onActivated: moveHost(-1) }
-    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: hostsOpen && hostFieldFocus === 0; onActivated: activateHost() }
-    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: hostsOpen && hostFieldFocus === 0; onActivated: activateHost() }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: hostsOpen && hostFieldFocus === 0 && !smbHostField.activeFocus && !smbUserField.activeFocus && !smbPasswordField.activeFocus; onActivated: activateHost() }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: hostsOpen && hostFieldFocus === 0 && !smbHostField.activeFocus && !smbUserField.activeFocus && !smbPasswordField.activeFocus; onActivated: activateHost() }
     Shortcut { sequence: "D"; context: Qt.ApplicationShortcut; enabled: letters && backend.hasSelection; onActivated: removeOpen = true }
     Shortcut { sequence: "U"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: passwordsOpen = true }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; enabled: !overlay && !filterField.activeFocus; onActivated: filterField.forceActiveFocus() }
@@ -488,7 +493,15 @@ ApplicationWindow {
                         id: hostRow
                         spacing: 6
                         Keycap { label: "H" }
+                        Keycap { label: "T" }
                         Text { anchors.verticalCenter: parent.verticalCenter; text: "computers"; color: "#7e8089"; font.family: win.font.family }
+                        Text {
+                            visible: win.windowsBusy() || backend.smbShares.length > 0
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: win.windowsBusy() ? "scanning" : (backend.smbShares.length === 1 ? "1 windows" : backend.smbShares.length + " windows")
+                            color: "#7e8089"
+                            font.family: win.font.family
+                        }
                     }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.openHosts() }
                 }
@@ -498,17 +511,6 @@ ApplicationWindow {
                 anchors.rightMargin: 14
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 14
-                Item {
-                    width: tailBar.implicitWidth
-                    height: tailBar.implicitHeight
-                    Row {
-                        id: tailBar
-                        spacing: 6
-                        Keycap { label: "T" }
-                        Text { anchors.verticalCenter: parent.verticalCenter; text: "tailscale"; color: "#7e8089"; font.family: win.font.family }
-                    }
-                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.openTailscale() }
-                }
                 Item {
                     width: backend.remote ? discRow.implicitWidth : 0
                     height: discRow.implicitHeight
@@ -558,7 +560,10 @@ ApplicationWindow {
                 Rectangle { anchors.right: parent.right; width: 1; height: parent.height; color: Qt.rgba(161 / 255, 163 / 255, 173 / 255, 0.12) }
 
                 Column {
-                    anchors.fill: parent
+                    id: sideHead
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
                     anchors.margins: 8
                     spacing: 0
 
@@ -584,26 +589,98 @@ ApplicationWindow {
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: backend.setProtocol(index) }
                         }
                     }
+                }
 
-                    Text { height: 32; width: parent.width; topPadding: 10; verticalAlignment: Text.AlignVCenter; leftPadding: 8; text: "REACHABLE AS"; color: "#7e8089"; font.bold: true; font.pixelSize: 11; font.letterSpacing: 1; font.family: win.font.family }
-                    Repeater {
-                        model: backend.reachable
-                        delegate: Text {
-                            required property string modelData
+                Flickable {
+                    anchors.top: sideHead.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: sideFoot.top
+                    anchors.leftMargin: 8
+                    anchors.rightMargin: 8
+                    contentHeight: sideMid.implicitHeight
+                    clip: true
+                    Column {
+                        id: sideMid
+                        width: parent.width
+                        spacing: 0
+                        Text { height: 32; width: parent.width; topPadding: 10; verticalAlignment: Text.AlignVCenter; leftPadding: 8; text: "REACHABLE AS"; color: "#7e8089"; font.bold: true; font.pixelSize: 11; font.letterSpacing: 1; font.family: win.font.family }
+                        Repeater {
+                            model: backend.reachable
+                            delegate: Text {
+                                required property string modelData
+                                leftPadding: 8
+                                topPadding: 4
+                                width: 170
+                                text: modelData
+                                color: "#bcbec8"
+                                wrapMode: Text.Wrap
+                                font.pixelSize: 11
+                                font.family: win.font.family
+                            }
+                        }
+                        Text {
+                            height: 32
+                            width: parent.width
+                            topPadding: 12
                             leftPadding: 8
-                            topPadding: 4
+                            text: "WINDOWS"
+                            color: "#7e8089"
+                            font.bold: true
+                            font.pixelSize: 11
+                            font.letterSpacing: 1
+                            font.family: win.font.family
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.openHosts() }
+                        }
+                        Text {
+                            visible: win.windowsBusy() || backend.smbStatus !== "" || (win.windowsScanned && backend.smbShares.length === 0)
+                            leftPadding: 8
+                            topPadding: 2
                             width: 170
-                            text: modelData
-                            color: "#bcbec8"
                             wrapMode: Text.Wrap
+                            maximumLineCount: 4
+                            elide: Text.ElideRight
+                            text: win.windowsBusy()
+                                  ? win.windowsScanText()
+                                  : (backend.smbStatus !== "" ? backend.smbStatus : (backend.smbError !== "" ? backend.smbError : "No Windows shares found"))
+                            color: !win.windowsBusy() && backend.smbStatus === "" && backend.smbError !== "" ? "#a17675" : "#7e8089"
                             font.pixelSize: 11
                             font.family: win.font.family
                         }
+                        Repeater {
+                            model: backend.smbShares
+                            delegate: Item {
+                                required property var modelData
+                                required property int index
+                                width: 170
+                                height: sideShare.implicitHeight + 8
+                                Column {
+                                    id: sideShare
+                                    x: 8
+                                    width: 162
+                                    spacing: 0
+                                    Text { width: parent.width; text: modelData.name; color: "#bcbec8"; font.pixelSize: 11; font.family: win.font.family; elide: Text.ElideRight }
+                                    Text {
+                                        width: parent.width
+                                        text: win.shareLine(modelData)
+                                        color: modelData.mountError && !modelData.mounting ? "#a17675" : "#7e8089"
+                                        font.pixelSize: 10
+                                        font.family: win.font.family
+                                        elide: Text.ElideRight
+                                    }
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: backend.openSmbShare(index, smbUserField.text, smbPasswordField.text)
+                                }
+                            }
+                        }
                     }
-                    Item { width: 1; height: 72 }
                 }
 
                 Rectangle {
+                    id: sideFoot
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
@@ -942,8 +1019,8 @@ ApplicationWindow {
                     "1 2 3 4    Samba, NFS, iSCSI, S3",
                     "J K    move through the list",
                     "/    filter",
-                    "H    computers, then Windows shares for SMB",
-                    "T    online Tailscale addresses",
+                    "H    computers, Tailscale, and Windows shares",
+                    "T    same window, first Tailscale computer",
                     "X    disconnect. X again leaves unsaved edits",
                     "N    new share. Browse lists that computer",
                     "Ctrl+O    browse again while creating",
@@ -1025,14 +1102,21 @@ ApplicationWindow {
         target: backend
         function onCreatePathChosen(path) { win.usePickedPath(path) }
         function onNeedsReady() { needsOpen = true }
-        function onComputerReady() { hostsOpen = false; tailscaleOpen = false }
-        function onHostChanged() {
-            if (!tailscaleOpen)
-                return
-            if (tailCursor >= 0 && tailCursor < backend.hosts.length && backend.hosts[tailCursor].via === "tailscale")
-                return
-            tailCursor = firstTailscale()
+        function onComputerReady() {
+            hostsOpen = false
+            if (backend.remote) {
+                if (backend.connectVia === "tailscale")
+                    backend.connectPublishedWindows("", "")
+                win.windowsScanWaiting = true
+                win.considerWindowsScan()
+            } else {
+                win.windowsScanWaiting = true
+                win.considerWindowsScan()
+            }
         }
+        function onModelChanged() { win.considerWindowsScan() }
+        function onHostChanged() { win.considerWindowsScan() }
+        function onSmbChanged() { if (!backend.smbScanning) win.windowsScanned = true }
         function onBrowseChanged() { win.browseCursor = 0; if (browseFlick) browseFlick.contentY = 0 }
     }
 
@@ -1145,34 +1229,54 @@ ApplicationWindow {
     }
 
     Rectangle {
+        id: hostDialog
         visible: win.hostsOpen
         anchors.centerIn: parent
-        width: 460
-        height: Math.min(win.height - 48, hostCol.implicitHeight + 36)
+        width: Math.min(win.width - 24, 980)
+        height: Math.min(win.height - 24, 700)
         clip: true
         color: "#16161e"
         border.color: "#424247"
-        Column {
+        Item {
             id: hostCol
-            x: 18
-            y: 18
-            width: 424
-            spacing: 8
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.margins: 18
+            width: 440
             Column {
                 id: hostIntro
-                width: 424
+                anchors.top: parent.top
+                anchors.left: parent.left
+                width: 440
                 spacing: 8
                 Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-                Text { width: 424; wrapMode: Text.Wrap; text: "Click a computer, or highlight one and press Connect. Tailscale in the top bar lists the online addresses on their own. A user and password belong to that computer. Leave the password empty for Tailscale SSH. The boxes below are for a computer that is not in the list. Passwords are not saved."; color: "#7e8089"; font.family: win.font.family }
+                Text {
+                    width: 440
+                    wrapMode: Text.Wrap
+                    text: backend.tailscaleBusy
+                          ? "Reading Tailscale…"
+                          : (win.tailscaleCount === 0
+                             ? "No Tailscale computers are online. "
+                             : (win.tailscaleCount === 1 ? "1 Tailscale computer is online. " : win.tailscaleCount + " Tailscale computers are online. "))
+                            + "Click a row, then Connect. Double-click or Enter does it too. T jumps to the first Tailscale computer. Leave the password empty for Tailscale SSH."
+                    color: "#7e8089"
+                    font.family: win.font.family
+                }
             }
             Flickable {
-                width: 424
-                height: Math.max(96, Math.min(220, win.height - 80 - hostIntro.implicitHeight - hostForm.implicitHeight))
+                id: hostFlick
+                anchors.top: hostIntro.bottom
+                anchors.bottom: hostForm.top
+                anchors.left: parent.left
+                anchors.topMargin: 8
+                anchors.bottomMargin: 8
+                width: 440
                 contentHeight: hostList.implicitHeight
                 clip: true
                 Column {
                     id: hostList
-                    width: 424
+                    width: 440
                     spacing: 4
                     Repeater {
                         model: backend.hosts
@@ -1180,7 +1284,7 @@ ApplicationWindow {
                             id: hostRow
                             required property var modelData
                             required property int index
-                            width: 424
+                            width: 440
                             height: modelData.via === "tailscale" ? tailCreds.implicitHeight + 12 : 46
                             color: index === win.hostCursor ? "#22222c" : "#0f0f18"
                             border.color: index === win.hostCursor ? "#6b6d76" : "#424247"
@@ -1219,15 +1323,30 @@ ApplicationWindow {
                                     peerPassword.text = modelData.password
                             }
 
+                            function ensureVisible() {
+                                if (!win.hostsOpen || index !== win.hostCursor)
+                                    return
+                                var y = mapToItem(hostFlick.contentItem, 0, 0).y
+                                if (y < hostFlick.contentY)
+                                    hostFlick.contentY = y
+                                else if (y + height > hostFlick.contentY + hostFlick.height)
+                                    hostFlick.contentY = Math.max(0, y + height - hostFlick.height)
+                            }
+
                             Component.onCompleted: fillLogin()
                             onModelDataChanged: fillLogin()
+                            Connections {
+                                target: win
+                                function onHostCursorChanged() { hostRow.ensureVisible() }
+                            }
 
                             MouseArea {
                                 z: 0
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
                                 preventStealing: true
-                                onClicked: hostRow.openThisHost()
+                                onClicked: win.hostCursor = index
+                                onDoubleClicked: hostRow.openThisHost()
                             }
                             Column {
                                 id: tailCreds
@@ -1239,16 +1358,24 @@ ApplicationWindow {
                                 anchors.rightMargin: 8
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 4
-                                Item {
+                                Column {
                                     width: parent.width
-                                    height: peerName.implicitHeight + peerDetail.implicitHeight + 2
+                                    spacing: 1
                                     Text { id: peerName; width: parent.width; elide: Text.ElideRight; text: modelData.name; color: "#bcbec8"; font.family: win.font.family }
+                                    Text {
+                                        visible: modelData.address !== ""
+                                        width: parent.width
+                                        elide: Text.ElideRight
+                                        text: modelData.address
+                                        color: theme.accent
+                                        font.pixelSize: 13
+                                        font.family: win.font.family
+                                    }
                                     Text {
                                         id: peerDetail
                                         width: parent.width
-                                        anchors.top: peerName.bottom
                                         elide: Text.ElideRight
-                                        text: modelData.detail
+                                        text: modelData.address !== "" ? modelData.summary : modelData.detail
                                         color: "#7e8089"
                                         font.pixelSize: 11
                                         font.family: win.font.family
@@ -1321,11 +1448,14 @@ ApplicationWindow {
             }
             Column {
                 id: hostForm
-                width: 424
+                anchors.left: parent.left
+                anchors.bottom: parent.bottom
+                width: 440
                 spacing: 8
+                Text { text: "Add a computer"; color: "#bcbec8"; font.family: win.font.family }
                 TextField {
                     id: hostUserField
-                    width: 424
+                    width: 440
                     placeholderText: "SSH user"
                     placeholderTextColor: "#7e8089"
                     color: "#a1a3ad"
@@ -1334,7 +1464,7 @@ ApplicationWindow {
                 }
                 TextField {
                     id: hostNameField
-                    width: 424
+                    width: 440
                     placeholderText: "Host or Tailscale name"
                     placeholderTextColor: "#7e8089"
                     color: "#a1a3ad"
@@ -1343,7 +1473,7 @@ ApplicationWindow {
                 }
                 TextField {
                     id: hostPortField
-                    width: 424
+                    width: 440
                     placeholderText: "Port 22"
                     placeholderTextColor: "#7e8089"
                     color: "#a1a3ad"
@@ -1353,7 +1483,7 @@ ApplicationWindow {
                 }
                 TextField {
                     id: hostPasswordField
-                    width: 424
+                    width: 440
                     placeholderText: "SSH password (optional)"
                     placeholderTextColor: "#7e8089"
                     color: "#a1a3ad"
@@ -1365,17 +1495,16 @@ ApplicationWindow {
                 }
                 Text {
                     visible: backend.connecting
-                    width: 424
+                    width: 440
                     wrapMode: Text.Wrap
                     text: backend.notice
                     color: "#a1a3ad"
                     font.family: win.font.family
                 }
-                Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 424; wrapMode: Text.Wrap; font.family: win.font.family }
+                Text { visible: backend.error !== ""; text: backend.error; color: "#a17675"; width: 440; wrapMode: Text.Wrap; font.family: win.font.family }
                 Flow {
-                    width: 424
+                    width: 440
                     spacing: 8
-                    ActionButton { label: "Windows shares"; onActivated: win.openSmbBrowser() }
                     ActionButton {
                         label: "Connect"
                         primary: true
@@ -1383,284 +1512,70 @@ ApplicationWindow {
                     }
                     ActionButton { label: "Disconnect"; visible: backend.remote; onActivated: win.requestDisconnect() }
                     ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: backend.trustHost() }
+                    ActionButton { label: backend.tailscaleBusy ? "Reading…" : "Refresh"; onActivated: backend.refreshHosts() }
                     ActionButton { label: "Close"; onActivated: win.hostsOpen = false }
                 }
             }
         }
-    }
 
-    Rectangle {
-        id: tailDialog
-        visible: win.tailscaleOpen
-        anchors.centerIn: parent
-        width: 560
-        height: Math.min(win.height - 48, 560)
-        color: "#16161e"
-        border.color: "#424247"
+        Rectangle {
+            anchors.left: hostCol.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 18
+            width: 1
+            color: Qt.rgba(161 / 255, 163 / 255, 173 / 255, 0.12)
+        }
+
         Column {
-            id: tailHead
-            anchors.left: parent.left
+            id: smbHead
+            anchors.left: hostCol.right
             anchors.right: parent.right
             anchors.top: parent.top
-            anchors.margins: 18
+            anchors.leftMargin: 36
+            anchors.rightMargin: 18
+            anchors.topMargin: 18
             spacing: 8
-            Text { text: "Tailscale"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+            Text { text: "Windows shares"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
             Text {
                 width: parent.width
                 wrapMode: Text.Wrap
+                text: backend.remote
+                      ? (backend.connectVia === "tailscale"
+                         ? "Connecting over Tailscale scans Tailscale addresses and mounts the Windows shares it can reach. Opening one uses the file manager. A password is not saved."
+                         : "Shares looks on " + backend.hostTitle + " when that computer connects, and lists what it can see. Opening a share still uses this computer. A password is not saved.")
+                      : "When Tailscale is running, Shares scans those addresses instead of the private network. Otherwise it scans this computer's local network. A password is not saved."
                 color: "#7e8089"
                 font.family: win.font.family
-                text: backend.tailscaleBusy
-                      ? "Reading Tailscale…"
-                      : win.tailscaleCount === 0
-                        ? "No Tailscale computers are online. Tailscale has to be running on this computer."
-                        : (win.tailscaleCount === 1 ? "1 online address." : win.tailscaleCount + " online addresses.")
-                          + " Click a row, then Connect. Double-click or Enter does it too. J and K move. A password is for this connection only and is not saved. Leave it empty for Tailscale SSH."
             }
             Text {
-                visible: backend.connecting
+                visible: backend.smbStatus !== ""
                 width: parent.width
                 wrapMode: Text.Wrap
-                text: backend.notice
+                text: backend.smbStatus
                 color: "#a1a3ad"
                 font.family: win.font.family
             }
             Text {
-                visible: backend.error !== ""
+                visible: backend.smbError !== ""
                 width: parent.width
                 wrapMode: Text.Wrap
-                text: backend.error
+                text: backend.smbError
                 color: "#a17675"
                 font.family: win.font.family
             }
         }
-        Flickable {
-            id: tailFlick
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: tailHead.bottom
-            anchors.bottom: tailButtons.top
-            anchors.leftMargin: 18
-            anchors.rightMargin: 18
-            anchors.topMargin: 8
-            anchors.bottomMargin: 8
-            contentHeight: tailList.implicitHeight
-            clip: true
-            Column {
-                id: tailList
-                width: tailFlick.width
-                spacing: 0
-                Repeater {
-                    model: backend.hosts
-                    delegate: Item {
-                        id: tailItem
-                        required property var modelData
-                        required property int index
-                        width: tailList.width
-                        height: modelData.via === "tailscale" ? tailCard.height + 6 : 0
-                        visible: modelData.via === "tailscale"
-                        enabled: modelData.via === "tailscale"
 
-                        function ensureVisible() {
-                            if (!visible || index !== win.tailCursor)
-                                return
-                            var y = mapToItem(tailFlick.contentItem, 0, 0).y
-                            if (y < tailFlick.contentY)
-                                tailFlick.contentY = y
-                            else if (y + height > tailFlick.contentY + tailFlick.height)
-                                tailFlick.contentY = Math.max(0, y + height - tailFlick.height)
-                        }
-
-                        function connectThis() {
-                            win.tailCursor = index
-                            win.notePeerEdit(modelData.id, tailUser.text, tailPassword.text)
-                            backend.setHostLogin(modelData.id, tailUser.text, tailPassword.text)
-                            backend.useHost(modelData.id, tailUser.text, tailPassword.text)
-                        }
-
-                        function noteTailFocus(focused) {
-                            if (focused) {
-                                win.tailCursor = index
-                                win.tailFieldFocus = 1
-                                return
-                            }
-                            Qt.callLater(function() {
-                                if (!tailUser.activeFocus && !tailPassword.activeFocus)
-                                    win.tailFieldFocus = 0
-                            })
-                        }
-
-                        function fillLogin() {
-                            if (!tailUser.activeFocus)
-                                tailUser.text = modelData.user || ""
-                            if (!tailPassword.activeFocus)
-                                tailPassword.text = modelData.password || ""
-                        }
-
-                        Component.onCompleted: fillLogin()
-                        onModelDataChanged: fillLogin()
-                        Connections {
-                            target: win
-                            function onTailCursorChanged() { tailItem.ensureVisible() }
-                        }
-
-                        Rectangle {
-                            id: tailCard
-                            width: parent.width
-                            height: tailCardCol.implicitHeight + 16
-                            color: index === win.tailCursor ? "#22222c" : (tailHover.hovered ? "#1c1c26" : "#0f0f18")
-                            border.color: index === win.tailCursor ? "#6b6d76" : "#424247"
-                            border.width: 1
-                            HoverHandler { id: tailHover }
-                            MouseArea {
-                                z: 0
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                preventStealing: true
-                                onClicked: win.tailCursor = index
-                                onDoubleClicked: tailItem.connectThis()
-                            }
-                            Column {
-                                id: tailCardCol
-                                z: 1
-                                x: 8
-                                y: 8
-                                width: parent.width - 16
-                                spacing: 4
-                                Row {
-                                    width: parent.width
-                                    spacing: 8
-                                    Column {
-                                        width: parent.width - tailConnect.width - 8
-                                        spacing: 1
-                                        Text {
-                                            width: parent.width
-                                            elide: Text.ElideRight
-                                            text: modelData.name || ""
-                                            color: "#bcbec8"
-                                            font.family: win.font.family
-                                        }
-                                        Text {
-                                            width: parent.width
-                                            elide: Text.ElideRight
-                                            text: modelData.address || modelData.name || ""
-                                            color: theme.accent
-                                            font.pixelSize: 14
-                                            font.family: win.font.family
-                                        }
-                                        Text {
-                                            width: parent.width
-                                            elide: Text.ElideRight
-                                            text: modelData.summary || ""
-                                            color: "#7e8089"
-                                            font.pixelSize: 11
-                                            font.family: win.font.family
-                                        }
-                                    }
-                                    ActionButton {
-                                        id: tailConnect
-                                        label: "Connect"
-                                        primary: index === win.tailCursor
-                                        onActivated: tailItem.connectThis()
-                                    }
-                                }
-                                Row {
-                                    width: parent.width
-                                    spacing: 8
-                                    TextField {
-                                        id: tailUser
-                                        width: 160
-                                        placeholderText: "User"
-                                        placeholderTextColor: "#7e8089"
-                                        color: "#a1a3ad"
-                                        font.family: win.font.family
-                                        inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
-                                        background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-                                        onActiveFocusChanged: {
-                                            tailItem.noteTailFocus(activeFocus)
-                                            if (activeFocus)
-                                                win.notePeerEdit(modelData.id, text, tailPassword.text)
-                                        }
-                                        onTextEdited: {
-                                            backend.setHostLogin(modelData.id, text, tailPassword.text)
-                                            win.notePeerEdit(modelData.id, text, tailPassword.text)
-                                        }
-                                        Keys.onReturnPressed: function(event) { tailItem.connectThis(); event.accepted = true }
-                                        Keys.onEnterPressed: function(event) { tailItem.connectThis(); event.accepted = true }
-                                    }
-                                    TextField {
-                                        id: tailPassword
-                                        width: parent.width - 168
-                                        echoMode: TextInput.Password
-                                        placeholderText: "Password"
-                                        placeholderTextColor: "#7e8089"
-                                        color: "#a1a3ad"
-                                        font.family: win.font.family
-                                        inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
-                                        background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
-                                        onActiveFocusChanged: {
-                                            tailItem.noteTailFocus(activeFocus)
-                                            if (activeFocus)
-                                                win.notePeerEdit(modelData.id, tailUser.text, text)
-                                        }
-                                        onTextEdited: {
-                                            backend.setHostLogin(modelData.id, tailUser.text, text)
-                                            win.notePeerEdit(modelData.id, tailUser.text, text)
-                                        }
-                                        Keys.onReturnPressed: function(event) { tailItem.connectThis(); event.accepted = true }
-                                        Keys.onEnterPressed: function(event) { tailItem.connectThis(); event.accepted = true }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Flow {
-            id: tailButtons
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            anchors.margins: 18
-            spacing: 8
-            ActionButton {
-                label: backend.tailscaleBusy ? "Reading…" : "Refresh"
-                onActivated: backend.refreshHosts()
-            }
-            ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: backend.trustHost() }
-            ActionButton { label: "Close"; onActivated: win.tailscaleOpen = false }
-        }
-    }
-
-    Rectangle {
-        visible: win.smbOpen
-        anchors.centerIn: parent
-        width: 500
-        height: Math.min(win.height - 48, smbCol.implicitHeight + 36)
-        clip: true
-        color: "#16161e"
-        border.color: "#424247"
         Column {
-            id: smbCol
-            x: 18
-            y: 18
-            width: 464
+            id: smbForm
+            anchors.left: smbHead.left
+            anchors.right: smbHead.right
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 18
             spacing: 8
-            Text { text: "Windows and SMB shares"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-            Text {
-                width: 464
-                wrapMode: Text.Wrap
-                text: backend.remote
-                      ? "Enter a server, or scan " + backend.hostTitle + "'s local network for Windows and Samba. The scan runs on that computer. Opening a share still uses this computer's file manager. Credentials are not saved."
-                      : "Enter a server, or scan this computer's local network for Windows and Samba. Credentials are optional and are not saved. Your file manager may ask for them again when you open a share."
-                color: "#7e8089"
-                font.family: win.font.family
-            }
             TextField {
                 id: smbHostField
-                width: 464
+                width: parent.width
                 placeholderText: "Server IP or host name"
                 placeholderTextColor: "#7e8089"
                 color: "#a1a3ad"
@@ -1670,11 +1585,11 @@ ApplicationWindow {
                 onAccepted: win.findSmbShares()
             }
             Row {
-                width: 464
+                width: parent.width
                 spacing: 8
                 TextField {
                     id: smbUserField
-                    width: 190
+                    width: Math.floor(parent.width * 0.42)
                     placeholderText: "Username (optional)"
                     placeholderTextColor: "#7e8089"
                     color: "#a1a3ad"
@@ -1685,7 +1600,7 @@ ApplicationWindow {
                 }
                 TextField {
                     id: smbPasswordField
-                    width: parent.width - 198
+                    width: parent.width - smbUserField.width - 8
                     placeholderText: "Password (optional)"
                     placeholderTextColor: "#7e8089"
                     color: "#a1a3ad"
@@ -1697,7 +1612,7 @@ ApplicationWindow {
                 }
             }
             Flow {
-                width: 464
+                width: parent.width
                 spacing: 8
                 ActionButton {
                     label: backend.smbScanning ? "Searching…" : "Find shares"
@@ -1705,71 +1620,60 @@ ApplicationWindow {
                     onActivated: win.findSmbShares()
                 }
                 ActionButton {
-                    label: backend.smbScanning ? "Scanning…" : "Scan network"
+                    label: backend.smbScanning ? "Scanning…" : "Scan again"
                     onActivated: win.scanSmbNetwork()
                 }
-                ActionButton { label: "Close"; onActivated: { backend.clearSmbShares(); smbOpen = false } }
             }
-            Text {
-                visible: backend.smbStatus !== ""
-                width: 464
-                wrapMode: Text.Wrap
-                text: backend.smbStatus
-                color: "#a1a3ad"
-                font.family: win.font.family
-            }
-            Text {
-                visible: backend.smbError !== ""
-                width: 464
-                wrapMode: Text.Wrap
-                text: backend.smbError
-                color: "#a17675"
-                font.family: win.font.family
-            }
-            Flickable {
-                width: 464
-                height: Math.min(280, smbShareList.implicitHeight)
-                contentHeight: smbShareList.implicitHeight
-                clip: true
-                Column {
-                    id: smbShareList
-                    width: 464
-                    spacing: 4
-                    Repeater {
-                        model: backend.smbShares
-                        delegate: Rectangle {
-                            required property var modelData
-                            required property int index
-                            width: 464
-                            height: 42
-                            color: "#0f0f18"
-                            border.color: "#424247"
-                            Row {
-                                anchors.fill: parent
-                                anchors.leftMargin: 8
-                                anchors.rightMargin: 8
-                                spacing: 8
-                                Column {
-                                    width: parent.width - openButton.width - 8
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    Text { width: parent.width; text: modelData.name; color: "#bcbec8"; font.family: win.font.family; elide: Text.ElideRight }
-                                    Text {
-                                        width: parent.width
-                                        text: modelData.host && modelData.comment ? modelData.host + " · " + modelData.comment : (modelData.host || modelData.comment || "")
-                                        color: "#7e8089"
-                                        font.pixelSize: 10
-                                        font.family: win.font.family
-                                        elide: Text.ElideRight
-                                    }
+        }
+
+        Flickable {
+            anchors.left: smbHead.left
+            anchors.right: smbHead.right
+            anchors.top: smbHead.bottom
+            anchors.bottom: smbForm.top
+            anchors.topMargin: 8
+            anchors.bottomMargin: 8
+            contentHeight: smbShareList.implicitHeight
+            clip: true
+            Column {
+                id: smbShareList
+                width: parent.width
+                spacing: 4
+                Repeater {
+                    model: backend.smbShares
+                    delegate: Rectangle {
+                        required property var modelData
+                        required property int index
+                        width: smbShareList.width
+                        height: 42
+                        color: "#0f0f18"
+                        border.color: "#424247"
+                        Row {
+                            anchors.fill: parent
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            spacing: 8
+                            Column {
+                                width: parent.width - openButton.width - 8
+                                anchors.verticalCenter: parent.verticalCenter
+                                Text { width: parent.width; text: modelData.name; color: "#bcbec8"; font.family: win.font.family; elide: Text.ElideRight }
+                                Text {
+                                    width: parent.width
+                                    text: win.shareDetail(modelData)
+                                    color: modelData.mountError && !modelData.mounting ? "#a17675" : "#7e8089"
+                                    font.pixelSize: 10
+                                    font.family: win.font.family
+                                    elide: Text.ElideRight
                                 }
-                                ActionButton { id: openButton; label: "Open"; onActivated: backend.openSmbShare(index) }
                             }
+                            ActionButton { id: openButton; label: "Open"; onActivated: backend.openSmbShare(index, smbUserField.text, smbPasswordField.text) }
                         }
                     }
                 }
             }
         }
     }
+
 
     Rectangle {
         visible: win.needsOpen

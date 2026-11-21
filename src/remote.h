@@ -66,6 +66,10 @@ private:
 QStringList sshLaunchArgs(bool tailscaleSsh, const QString &target, int port, bool trustNext,
                           const QString &controlPath, bool withPassword = false);
 
+// The https://login.tailscale.com/a/ link from Tailscale's SSH check, or
+// empty. A check message without that host is ignored.
+QString tailscaleAuthUrl(const QString &text);
+
 // A private helper ssh runs when a password was typed. The helper reads
 // SHARES_SSH_PASSWORD from the environment. The password is not in the file.
 QString sshAskpassProgram(QString *error);
