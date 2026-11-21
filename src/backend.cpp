@@ -861,8 +861,11 @@ void Backend::finishReload(int wave, const QString &pullError) {
         m_library.reachable.clear();
         m_library.users.clear();
         m_library.tailscaleStatus.clear();
+        // The list stays empty until the local tailscale probe returns.
+        m_tailscaleBusy = true;
     } else {
         m_library.loadStatus();
+        m_tailscaleBusy = false;
     }
     copyFromLibrary();
     m_filter.clear();
@@ -953,6 +956,7 @@ void Backend::applyLiveStatus(const LiveStatus &status) {
     m_iscsiState = status.iscsiState;
     m_reachable = status.reachable;
     m_users = status.users;
+    m_tailscaleBusy = false;
     m_peers = tailscalePeers(status.tailscaleStatus);
     publishHosts();
     touch();
@@ -2646,6 +2650,9 @@ void Backend::publishHosts() {
     m_hostRows << QVariantMap{{"id", "local"},
                               {"name", "This computer"},
                               {"detail", "the computer running this window"},
+                              {"summary", ""},
+                              {"address", ""},
+                              {"system", ""},
                               {"via", ""},
                               {"user", ""},
                               {"password", ""}};
@@ -2653,12 +2660,23 @@ void Backend::publishHosts() {
         const auto id = QStringLiteral("ts:") + peer.host;
         const auto storedUser = m_loginUsers.value(id);
         const auto shown = storedUser.isEmpty() ? localUser() : storedUser;
-        auto detail = peer.host;
-        detail += QStringLiteral(" · ") + shown;
-        detail += peer.tailscaleSsh ? QStringLiteral(" · Tailscale SSH") : QStringLiteral(" · tailscale");
+        // The address is its own line in the Tailscale window. The summary is
+        // everything else, and the computers list keeps both on one line.
+        QStringList summaryParts;
+        if (!peer.os.isEmpty())
+            summaryParts << peer.os;
+        if (!peer.host.isEmpty() && peer.host != peer.address)
+            summaryParts << peer.host;
+        summaryParts << shown;
+        summaryParts << (peer.tailscaleSsh ? QStringLiteral("Tailscale SSH") : QStringLiteral("tailscale"));
+        const auto summary = summaryParts.join(QStringLiteral(" · "));
+        const auto detail = peer.address.isEmpty() ? summary : peer.address + QStringLiteral(" · ") + summary;
         m_hostRows << QVariantMap{{"id", id},
                                   {"name", peer.name},
                                   {"detail", detail},
+                                  {"summary", summary},
+                                  {"address", peer.address},
+                                  {"system", peer.os},
                                   {"via", "tailscale"},
                                   {"user", shown},
                                   {"password", m_loginPasswords.value(id)}};
@@ -2667,6 +2685,9 @@ void Backend::publishHosts() {
         m_hostRows << QVariantMap{{"id", "saved:" + saved.user + "@" + saved.host + ":" + QString::number(saved.port)},
                                   {"name", saved.name},
                                   {"detail", saved.user + "@" + saved.host},
+                                  {"summary", ""},
+                                  {"address", ""},
+                                  {"system", ""},
                                   {"via", saved.via},
                                   {"user", saved.user},
                                   {"password", ""}};
@@ -2676,6 +2697,7 @@ void Backend::publishHosts() {
 
 void Backend::refreshHosts() {
     auto apply = [this](const CommandResult &status) {
+        m_tailscaleBusy = false;
         m_library.tailscaleStatus = (!status.missing && status.code == 0) ? status.out : QString();
         m_peers = tailscalePeers(m_library.tailscaleStatus);
         publishHosts();
@@ -2684,6 +2706,9 @@ void Backend::refreshHosts() {
         apply(m_localCommands->run("tailscale", {"status", "--json"}, {}, m_localCommands->probeTimeoutMs()));
         return;
     }
+    // Keep the previous list on screen while a new read is in flight.
+    m_tailscaleBusy = true;
+    publishHosts();
     auto commands = m_owned;
     const int wave = ++m_hostWave;
     QPointer<Backend> self(this);
@@ -2695,6 +2720,7 @@ void Backend::refreshHosts() {
         QMetaObject::invokeMethod(app, [self, wave, status] {
             if (!self || wave != self->m_hostWave)
                 return;
+            self->m_tailscaleBusy = false;
             self->m_library.tailscaleStatus = (!status.missing && status.code == 0) ? status.out : QString();
             self->m_peers = tailscalePeers(self->m_library.tailscaleStatus);
             self->publishHosts();

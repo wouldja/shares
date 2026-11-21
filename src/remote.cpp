@@ -14,6 +14,7 @@
 #include <QSaveFile>
 #include <QStandardPaths>
 
+#include <algorithm>
 #include <utility>
 
 namespace {
@@ -439,11 +440,16 @@ QVector<RemoteHost> tailscalePeers(const QString &json) {
             host.name = dns.isEmpty() ? ip : dns.section('.', 0, 0);
         host.host = dns.isEmpty() ? ip : dns;
         host.address = ip;
+        host.os = peer.value("OS").toString();
         host.via = "tailscale";
         host.tailscaleSsh = !peer.value("sshHostKeys").toArray().isEmpty();
         if (remoteTargetOk("peer", host.host, 22))
             hosts.append(host);
     }
+    // The status object is keyed by node key. The window lists machines by name.
+    std::sort(hosts.begin(), hosts.end(), [](const RemoteHost &a, const RemoteHost &b) {
+        return QString::compare(a.name, b.name, Qt::CaseInsensitive) < 0;
+    });
     return hosts;
 }
 

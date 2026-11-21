@@ -729,6 +729,10 @@ private slots:
         QVERIFY(pve != rows.cend());
         QVERIFY(pve->toMap().value("detail").toString().contains("Tailscale SSH"));
         QVERIFY(pve->toMap().value("detail").toString().contains("pve.example.ts.net"));
+        QCOMPARE(pve->toMap().value("address").toString(), QString("100.100.100.2"));
+        QVERIFY(pve->toMap().value("detail").toString().startsWith("100.100.100.2"));
+        QVERIFY(pve->toMap().value("summary").toString().contains("pve.example.ts.net"));
+        QVERIFY(!backend.tailscaleBusy());
         int statusCalls = 0;
         for (const auto &call : commands.calls) {
             if (call.join(' ') == "tailscale status --json")

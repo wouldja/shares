@@ -65,6 +65,7 @@ class Backend : public QObject {
     Q_PROPERTY(QString browseFile READ browseFile NOTIFY browseChanged)
     Q_PROPERTY(QString hostTitle READ hostTitle NOTIFY hostChanged)
     Q_PROPERTY(QVariantList hosts READ hosts NOTIFY hostChanged)
+    Q_PROPERTY(bool tailscaleBusy READ tailscaleBusy NOTIFY hostChanged)
     Q_PROPERTY(QString needsText READ needsText NOTIFY hostChanged)
     Q_PROPERTY(bool canInstall READ canInstall NOTIFY hostChanged)
     Q_PROPERTY(bool sudoPasswordNeeded READ sudoPasswordNeeded NOTIFY hostChanged)
@@ -109,6 +110,7 @@ public:
     QString browseFile() const { return m_browseFile; }
     QString hostTitle() const { return m_hostTitle; }
     QVariantList hosts() const { return m_hostRows; }
+    bool tailscaleBusy() const { return m_tailscaleBusy; }
     QString needsText() const { return m_needsText; }
     bool canInstall() const { return m_canInstall; }
     bool sudoPasswordNeeded() const { return m_sudoPasswordNeeded; }
@@ -304,6 +306,7 @@ private:
     int m_smbWave = 0;
     bool m_smbScanning = false;
     QVariantList m_hostRows;
+    bool m_tailscaleBusy = false;
     QVector<RemoteHost> m_saved;
     QVector<RemoteHost> m_peers;
     // Tailscale row logins, keyed by "ts:" + host. Users are written to the

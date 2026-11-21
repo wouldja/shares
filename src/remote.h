@@ -16,6 +16,7 @@ struct RemoteHost {
     int port = 22;
     QString via;
     QString address;
+    QString os;
     QString password;
     bool tailscaleSsh = false;
 };

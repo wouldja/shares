@@ -28,22 +28,34 @@ ApplicationWindow {
     property bool importOpen: false
     property bool quitOpen: false
     property bool hostsOpen: false
+    property bool tailscaleOpen: false
     property bool smbOpen: false
     property bool needsOpen: false
     property bool leaveOpen: false
     property int hostCursor: 0
     property int hostFieldFocus: 0
+    property int tailCursor: -1
+    property int tailFieldFocus: 0
     property string peerEditId: ""
     property string peerEditUser: ""
     property string peerEditPassword: ""
+    readonly property int tailscaleCount: {
+        var n = 0
+        var rows = backend.hosts
+        for (var i = 0; i < rows.length; ++i) {
+            if (rows[i].via === "tailscale")
+                n++
+        }
+        return n
+    }
     readonly property bool typing: filterField.activeFocus || nameField.activeFocus || pathField.activeFocus
         || editorField.activeFocus || globalField.activeFocus || importField.activeFocus
         || accountField.activeFocus || secretField.activeFocus || serviceField.activeFocus
         || hostUserField.activeFocus || hostNameField.activeFocus || hostPortField.activeFocus || hostPasswordField.activeFocus
         || smbHostField.activeFocus || smbUserField.activeFocus || smbPasswordField.activeFocus
         || remoteFolderField.activeFocus || remoteImageField.activeFocus
-        || hostFieldFocus > 0
-    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || smbOpen || needsOpen || leaveOpen
+        || hostFieldFocus > 0 || tailFieldFocus > 0
+    readonly property bool overlay: helpOpen || createOpen || removeOpen || passwordsOpen || editorOpen || globalOpen || importOpen || quitOpen || hostsOpen || tailscaleOpen || smbOpen || needsOpen || leaveOpen
     property int browseCursor: 0
     readonly property bool letters: !overlay && !typing
 
@@ -57,6 +69,8 @@ ApplicationWindow {
         importOpen = false
         quitOpen = false
         hostsOpen = false
+        tailscaleOpen = false
+        tailFieldFocus = 0
         backend.clearSmbShares()
         smbOpen = false
         needsOpen = false
@@ -66,9 +80,11 @@ ApplicationWindow {
     function requestDisconnect() {
         if (!backend.remote) {
             hostsOpen = false
+            tailscaleOpen = false
             return
         }
         hostsOpen = false
+        tailscaleOpen = false
         needsOpen = false
         helpOpen = false
         if (backend.canUndo) {
@@ -82,6 +98,7 @@ ApplicationWindow {
         backend.leaveComputer()
         leaveOpen = false
         hostsOpen = false
+        tailscaleOpen = false
         needsOpen = false
         helpOpen = false
     }
@@ -212,7 +229,55 @@ ApplicationWindow {
     function openHosts() {
         backend.refreshHosts()
         hostCursor = 0
+        tailscaleOpen = false
         hostsOpen = true
+    }
+
+    function firstTailscale() {
+        for (var i = 0; i < backend.hosts.length; ++i) {
+            if (backend.hosts[i].via === "tailscale")
+                return i
+        }
+        return -1
+    }
+
+    function openTailscale() {
+        backend.refreshHosts()
+        hostsOpen = false
+        tailscaleOpen = true
+        if (tailCursor < 0 || tailCursor >= backend.hosts.length || backend.hosts[tailCursor].via !== "tailscale")
+            tailCursor = firstTailscale()
+    }
+
+    function moveTail(delta) {
+        var ids = []
+        for (var i = 0; i < backend.hosts.length; ++i) {
+            if (backend.hosts[i].via === "tailscale")
+                ids.push(i)
+        }
+        if (ids.length < 1)
+            return
+        var pos = ids.indexOf(tailCursor)
+        if (pos < 0)
+            pos = delta < 0 ? ids.length - 1 : 0
+        else
+            pos = (pos + delta + ids.length) % ids.length
+        tailCursor = ids[pos]
+    }
+
+    function connectTail(index) {
+        if (index < 0 || index >= backend.hosts.length)
+            return
+        var row = backend.hosts[index]
+        if (!row || row.via !== "tailscale")
+            return
+        tailCursor = index
+        if (peerEditId === row.id) {
+            backend.setHostLogin(row.id, peerEditUser, peerEditPassword)
+            backend.useHost(row.id, peerEditUser, peerEditPassword)
+        } else {
+            backend.useHost(row.id)
+        }
     }
 
     function moveHost(delta) {
@@ -310,6 +375,13 @@ ApplicationWindow {
     Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: backend.copyAddress() }
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openCreate() }
     Shortcut { sequence: "H"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openHosts() }
+    Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: letters; onActivated: openTailscale() }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(1) }
+    Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(-1) }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(1) }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: moveTail(-1) }
+    Shortcut { sequence: "Return"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: connectTail(tailCursor) }
+    Shortcut { sequence: "Enter"; context: Qt.ApplicationShortcut; enabled: tailscaleOpen && !typing; onActivated: connectTail(tailCursor) }
     Shortcut {
         sequence: "X"
         context: Qt.ApplicationShortcut
@@ -364,12 +436,13 @@ ApplicationWindow {
         property string key: ""
         property bool primary: false
         property bool danger: false
+        property bool hovered: false
         signal activated()
         width: row.implicitWidth + 20
         height: 28
-        color: "transparent"
+        color: hovered ? Qt.rgba(161 / 255, 163 / 255, 173 / 255, 0.12) : "transparent"
         border.width: 1
-        border.color: danger ? "#a17675" : primary ? theme.accent : "#424247"
+        border.color: danger ? "#a17675" : primary ? theme.accent : (hovered ? "#6b6d76" : "#424247")
         Row {
             id: row
             anchors.centerIn: parent
@@ -382,7 +455,14 @@ ApplicationWindow {
             }
             Keycap { label: key; visible: key !== "" }
         }
-        MouseArea { anchors.fill: parent; onClicked: parent.activated() }
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            preventStealing: true
+            cursorShape: Qt.PointingHandCursor
+            onContainsMouseChanged: parent.hovered = containsMouse
+            onClicked: parent.activated()
+        }
     }
 
     ColumnLayout {
@@ -410,7 +490,7 @@ ApplicationWindow {
                         Keycap { label: "H" }
                         Text { anchors.verticalCenter: parent.verticalCenter; text: "computers"; color: "#7e8089"; font.family: win.font.family }
                     }
-                    MouseArea { anchors.fill: parent; onClicked: win.openHosts() }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.openHosts() }
                 }
             }
             Row {
@@ -418,6 +498,17 @@ ApplicationWindow {
                 anchors.rightMargin: 14
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 14
+                Item {
+                    width: tailBar.implicitWidth
+                    height: tailBar.implicitHeight
+                    Row {
+                        id: tailBar
+                        spacing: 6
+                        Keycap { label: "T" }
+                        Text { anchors.verticalCenter: parent.verticalCenter; text: "tailscale"; color: "#7e8089"; font.family: win.font.family }
+                    }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.openTailscale() }
+                }
                 Item {
                     width: backend.remote ? discRow.implicitWidth : 0
                     height: discRow.implicitHeight
@@ -428,17 +519,29 @@ ApplicationWindow {
                         Keycap { label: "X" }
                         Text { anchors.verticalCenter: parent.verticalCenter; text: "disconnect"; color: "#7e8089"; font.family: win.font.family }
                     }
-                    MouseArea { anchors.fill: parent; onClicked: win.requestDisconnect() }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.requestDisconnect() }
                 }
-                Row {
-                    spacing: 6
-                    Keycap { label: "?" }
-                    Text { anchors.verticalCenter: parent.verticalCenter; text: "keys"; color: "#7e8089"; font.family: win.font.family }
+                Item {
+                    width: keysBar.implicitWidth
+                    height: keysBar.implicitHeight
+                    Row {
+                        id: keysBar
+                        spacing: 6
+                        Keycap { label: "?" }
+                        Text { anchors.verticalCenter: parent.verticalCenter; text: "keys"; color: "#7e8089"; font.family: win.font.family }
+                    }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.helpOpen = !win.helpOpen }
                 }
-                Row {
-                    spacing: 6
-                    Keycap { label: "Q" }
-                    Text { anchors.verticalCenter: parent.verticalCenter; text: "quit"; color: "#7e8089"; font.family: win.font.family }
+                Item {
+                    width: quitBar.implicitWidth
+                    height: quitBar.implicitHeight
+                    Row {
+                        id: quitBar
+                        spacing: 6
+                        Keycap { label: "Q" }
+                        Text { anchors.verticalCenter: parent.verticalCenter; text: "quit"; color: "#7e8089"; font.family: win.font.family }
+                    }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.requestQuit() }
                 }
             }
         }
@@ -478,7 +581,7 @@ ApplicationWindow {
                                 Text { anchors.verticalCenter: parent.verticalCenter; text: modelData; color: backend.protocol === index ? "#bcbec8" : "#a1a3ad"; font.family: win.font.family }
                             }
                             Text { anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; text: backend.counts[index]; color: "#7e8089"; font.family: win.font.family }
-                            MouseArea { anchors.fill: parent; onClicked: backend.setProtocol(index) }
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: backend.setProtocol(index) }
                         }
                     }
 
@@ -510,11 +613,17 @@ ApplicationWindow {
                     Text {
                         anchors.fill: parent
                         anchors.margins: 8
-                        text: backend.protocol === 0 ? backend.foot + "\nSamba passwords  U" : backend.foot
+                        text: backend.protocol === 0 ? backend.foot + "\nSamba passwords  U" : backend.protocol === 3 ? backend.foot + "\nAccess keys  U" : backend.foot
                         color: "#7e8089"
                         font.pixelSize: 11
                         wrapMode: Text.Wrap
                         font.family: win.font.family
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: backend.protocol === 0 || backend.protocol === 3
+                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: win.passwordsOpen = true
                     }
                 }
             }
@@ -637,7 +746,12 @@ ApplicationWindow {
                                 }
                             }
                             Text { anchors.right: parent.right; anchors.rightMargin: 10; anchors.bottom: parent.bottom; anchors.bottomMargin: 8; text: modelData.meta; color: "#7e8089"; font.pixelSize: 11; font.family: win.font.family }
-                            MouseArea { anchors.fill: parent; onClicked: backend.select(modelData.id) }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: backend.select(modelData.id)
+                                onDoubleClicked: win.openEditor()
+                            }
                         }
                     }
                     }
@@ -723,7 +837,7 @@ ApplicationWindow {
                                         height: 16
                                         color: modelData.on ? "#a1a3ad" : "#7e8089"
                                     }
-                                    MouseArea { anchors.fill: parent; onClicked: backend.toggle(modelData.key) }
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: backend.toggle(modelData.key) }
                                 }
                             }
                         }
@@ -748,7 +862,7 @@ ApplicationWindow {
                         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Qt.rgba(161 / 255, 163 / 255, 173 / 255, 0.12) }
                         Text { anchors.verticalCenter: parent.verticalCenter; text: "Advanced"; color: "#a1a3ad"; font.family: win.font.family }
                         Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: (backend.detail.advanced || "") + " ›"; color: "#7e8089"; font.family: win.font.family }
-                        MouseArea { anchors.fill: parent; onClicked: win.openEditor() }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.openEditor() }
                     }
                 }
                 }
@@ -829,6 +943,7 @@ ApplicationWindow {
                     "J K    move through the list",
                     "/    filter",
                     "H    computers, then Windows shares for SMB",
+                    "T    online Tailscale addresses",
                     "X    disconnect. X again leaves unsaved edits",
                     "N    new share. Browse lists that computer",
                     "Ctrl+O    browse again while creating",
@@ -910,7 +1025,14 @@ ApplicationWindow {
         target: backend
         function onCreatePathChosen(path) { win.usePickedPath(path) }
         function onNeedsReady() { needsOpen = true }
-        function onComputerReady() { hostsOpen = false }
+        function onComputerReady() { hostsOpen = false; tailscaleOpen = false }
+        function onHostChanged() {
+            if (!tailscaleOpen)
+                return
+            if (tailCursor >= 0 && tailCursor < backend.hosts.length && backend.hosts[tailCursor].via === "tailscale")
+                return
+            tailCursor = firstTailscale()
+        }
         function onBrowseChanged() { win.browseCursor = 0; if (browseFlick) browseFlick.contentY = 0 }
     }
 
@@ -1041,7 +1163,7 @@ ApplicationWindow {
                 width: 424
                 spacing: 8
                 Text { text: "Computers"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
-                Text { width: 424; wrapMode: Text.Wrap; text: "Click a computer, or highlight one and press Connect. A Tailscale user and password belong to that computer. Leave the password empty for Tailscale SSH. The boxes below are for a computer that is not in the list. Passwords are not saved."; color: "#7e8089"; font.family: win.font.family }
+                Text { width: 424; wrapMode: Text.Wrap; text: "Click a computer, or highlight one and press Connect. Tailscale in the top bar lists the online addresses on their own. A user and password belong to that computer. Leave the password empty for Tailscale SSH. The boxes below are for a computer that is not in the list. Passwords are not saved."; color: "#7e8089"; font.family: win.font.family }
             }
             Flickable {
                 width: 424
@@ -1103,6 +1225,8 @@ ApplicationWindow {
                             MouseArea {
                                 z: 0
                                 anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                preventStealing: true
                                 onClicked: hostRow.openThisHost()
                             }
                             Column {
@@ -1262,6 +1386,251 @@ ApplicationWindow {
                     ActionButton { label: "Close"; onActivated: win.hostsOpen = false }
                 }
             }
+        }
+    }
+
+    Rectangle {
+        id: tailDialog
+        visible: win.tailscaleOpen
+        anchors.centerIn: parent
+        width: 560
+        height: Math.min(win.height - 48, 560)
+        color: "#16161e"
+        border.color: "#424247"
+        Column {
+            id: tailHead
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 18
+            spacing: 8
+            Text { text: "Tailscale"; color: "#bcbec8"; font.pixelSize: 16; font.bold: true; font.family: win.font.family }
+            Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                color: "#7e8089"
+                font.family: win.font.family
+                text: backend.tailscaleBusy
+                      ? "Reading Tailscale…"
+                      : win.tailscaleCount === 0
+                        ? "No Tailscale computers are online. Tailscale has to be running on this computer."
+                        : (win.tailscaleCount === 1 ? "1 online address." : win.tailscaleCount + " online addresses.")
+                          + " Click a row, then Connect. Double-click or Enter does it too. J and K move. A password is for this connection only and is not saved. Leave it empty for Tailscale SSH."
+            }
+            Text {
+                visible: backend.connecting
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: backend.notice
+                color: "#a1a3ad"
+                font.family: win.font.family
+            }
+            Text {
+                visible: backend.error !== ""
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: backend.error
+                color: "#a17675"
+                font.family: win.font.family
+            }
+        }
+        Flickable {
+            id: tailFlick
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: tailHead.bottom
+            anchors.bottom: tailButtons.top
+            anchors.leftMargin: 18
+            anchors.rightMargin: 18
+            anchors.topMargin: 8
+            anchors.bottomMargin: 8
+            contentHeight: tailList.implicitHeight
+            clip: true
+            Column {
+                id: tailList
+                width: tailFlick.width
+                spacing: 0
+                Repeater {
+                    model: backend.hosts
+                    delegate: Item {
+                        id: tailItem
+                        required property var modelData
+                        required property int index
+                        width: tailList.width
+                        height: modelData.via === "tailscale" ? tailCard.height + 6 : 0
+                        visible: modelData.via === "tailscale"
+                        enabled: modelData.via === "tailscale"
+
+                        function ensureVisible() {
+                            if (!visible || index !== win.tailCursor)
+                                return
+                            var y = mapToItem(tailFlick.contentItem, 0, 0).y
+                            if (y < tailFlick.contentY)
+                                tailFlick.contentY = y
+                            else if (y + height > tailFlick.contentY + tailFlick.height)
+                                tailFlick.contentY = Math.max(0, y + height - tailFlick.height)
+                        }
+
+                        function connectThis() {
+                            win.tailCursor = index
+                            win.notePeerEdit(modelData.id, tailUser.text, tailPassword.text)
+                            backend.setHostLogin(modelData.id, tailUser.text, tailPassword.text)
+                            backend.useHost(modelData.id, tailUser.text, tailPassword.text)
+                        }
+
+                        function noteTailFocus(focused) {
+                            if (focused) {
+                                win.tailCursor = index
+                                win.tailFieldFocus = 1
+                                return
+                            }
+                            Qt.callLater(function() {
+                                if (!tailUser.activeFocus && !tailPassword.activeFocus)
+                                    win.tailFieldFocus = 0
+                            })
+                        }
+
+                        function fillLogin() {
+                            if (!tailUser.activeFocus)
+                                tailUser.text = modelData.user || ""
+                            if (!tailPassword.activeFocus)
+                                tailPassword.text = modelData.password || ""
+                        }
+
+                        Component.onCompleted: fillLogin()
+                        onModelDataChanged: fillLogin()
+                        Connections {
+                            target: win
+                            function onTailCursorChanged() { tailItem.ensureVisible() }
+                        }
+
+                        Rectangle {
+                            id: tailCard
+                            width: parent.width
+                            height: tailCardCol.implicitHeight + 16
+                            color: index === win.tailCursor ? "#22222c" : (tailHover.hovered ? "#1c1c26" : "#0f0f18")
+                            border.color: index === win.tailCursor ? "#6b6d76" : "#424247"
+                            border.width: 1
+                            HoverHandler { id: tailHover }
+                            MouseArea {
+                                z: 0
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                preventStealing: true
+                                onClicked: win.tailCursor = index
+                                onDoubleClicked: tailItem.connectThis()
+                            }
+                            Column {
+                                id: tailCardCol
+                                z: 1
+                                x: 8
+                                y: 8
+                                width: parent.width - 16
+                                spacing: 4
+                                Row {
+                                    width: parent.width
+                                    spacing: 8
+                                    Column {
+                                        width: parent.width - tailConnect.width - 8
+                                        spacing: 1
+                                        Text {
+                                            width: parent.width
+                                            elide: Text.ElideRight
+                                            text: modelData.name || ""
+                                            color: "#bcbec8"
+                                            font.family: win.font.family
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            elide: Text.ElideRight
+                                            text: modelData.address || modelData.name || ""
+                                            color: theme.accent
+                                            font.pixelSize: 14
+                                            font.family: win.font.family
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            elide: Text.ElideRight
+                                            text: modelData.summary || ""
+                                            color: "#7e8089"
+                                            font.pixelSize: 11
+                                            font.family: win.font.family
+                                        }
+                                    }
+                                    ActionButton {
+                                        id: tailConnect
+                                        label: "Connect"
+                                        primary: index === win.tailCursor
+                                        onActivated: tailItem.connectThis()
+                                    }
+                                }
+                                Row {
+                                    width: parent.width
+                                    spacing: 8
+                                    TextField {
+                                        id: tailUser
+                                        width: 160
+                                        placeholderText: "User"
+                                        placeholderTextColor: "#7e8089"
+                                        color: "#a1a3ad"
+                                        font.family: win.font.family
+                                        inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+                                        background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                                        onActiveFocusChanged: {
+                                            tailItem.noteTailFocus(activeFocus)
+                                            if (activeFocus)
+                                                win.notePeerEdit(modelData.id, text, tailPassword.text)
+                                        }
+                                        onTextEdited: {
+                                            backend.setHostLogin(modelData.id, text, tailPassword.text)
+                                            win.notePeerEdit(modelData.id, text, tailPassword.text)
+                                        }
+                                        Keys.onReturnPressed: function(event) { tailItem.connectThis(); event.accepted = true }
+                                        Keys.onEnterPressed: function(event) { tailItem.connectThis(); event.accepted = true }
+                                    }
+                                    TextField {
+                                        id: tailPassword
+                                        width: parent.width - 168
+                                        echoMode: TextInput.Password
+                                        placeholderText: "Password"
+                                        placeholderTextColor: "#7e8089"
+                                        color: "#a1a3ad"
+                                        font.family: win.font.family
+                                        inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                                        background: Rectangle { color: "#0f0f18"; border.color: "#424247" }
+                                        onActiveFocusChanged: {
+                                            tailItem.noteTailFocus(activeFocus)
+                                            if (activeFocus)
+                                                win.notePeerEdit(modelData.id, tailUser.text, text)
+                                        }
+                                        onTextEdited: {
+                                            backend.setHostLogin(modelData.id, tailUser.text, text)
+                                            win.notePeerEdit(modelData.id, tailUser.text, text)
+                                        }
+                                        Keys.onReturnPressed: function(event) { tailItem.connectThis(); event.accepted = true }
+                                        Keys.onEnterPressed: function(event) { tailItem.connectThis(); event.accepted = true }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Flow {
+            id: tailButtons
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: 18
+            spacing: 8
+            ActionButton {
+                label: backend.tailscaleBusy ? "Reading…" : "Refresh"
+                onActivated: backend.refreshHosts()
+            }
+            ActionButton { label: "Trust key"; visible: backend.canTrustHost; onActivated: backend.trustHost() }
+            ActionButton { label: "Close"; onActivated: win.tailscaleOpen = false }
         }
     }
 
